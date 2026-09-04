@@ -150,12 +150,20 @@ namespace dxvk {
   static_assert(sizeof(Vector4i) == sizeof(int)   * 4);
 
   inline Vector4 replaceNaN(Vector4 a) {
+#if defined(DXVK_LEGACY_ARCH_X86)
     Vector4 result;
     __m128 value = _mm_load_ps(a.data);
     __m128 mask  = _mm_cmpeq_ps(value, value);
            value = _mm_and_ps(value, mask);
     _mm_store_ps(result.data, value);
     return result;
+#else
+    for (uint32_t i = 0; i < 4; i++) {
+      if (std::isnan(a[i]))
+        a[i] = 0.0f;
+    }
+    return a;
+#endif
   }
 
 }

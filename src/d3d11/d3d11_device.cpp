@@ -24,9 +24,33 @@
 #include "d3d11_texture.h"
 #include "d3d11_video.h"
 
+#include "../dxvk/dxvk_winehua_trace.h"
+#include "../util/util_env.h"
 #include "../util/util_shared_res.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+#include "../dxgi/dxgi_ohos_swapchain.h"
+#endif
+
 namespace dxvk {
+
+#if defined(DXVK_NATIVE_OHOS)
+  constexpr bool NativeOhosRelaxedDeviceFeatures = true;
+#else
+  constexpr bool NativeOhosRelaxedDeviceFeatures = false;
+#endif
+
+  static bool winehuaRelaxedDriverFeatures() {
+    static const bool enabled = NativeOhosRelaxedDeviceFeatures
+      || env::getEnvVar("WINEHUA_DXVK_RELAXED_FEATURES") == "1";
+    return enabled;
+  }
+
+  static bool winehuaBcEmulationEnabled() {
+    static const bool enabled = NativeOhosRelaxedDeviceFeatures
+      || env::getEnvVar("WINEHUA_DXVK_BC_EMULATION") != "0";
+    return enabled;
+  }
   
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
 
@@ -91,9 +115,17 @@ namespace dxvk {
       return S_FALSE;
     
     try {
+      winehuaFlowTrace(str::format(
+        "d3d11-create-buffer begin size=", desc.ByteWidth,
+        " usage=", uint32_t(desc.Usage),
+        " bind=", desc.BindFlags,
+        " cpu=", desc.CPUAccessFlags,
+        " initial=", pInitialData && pInitialData->pSysMem ? 1 : 0));
       const Com<D3D11Buffer> buffer = new D3D11Buffer(this, &desc);
+      winehuaFlowTrace("d3d11-create-buffer object-ready");
       m_initializer->InitBuffer(buffer.ptr(), pInitialData);
       *ppBuffer = buffer.ref();
+      winehuaFlowTrace("d3d11-create-buffer end");
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
@@ -210,9 +242,20 @@ namespace dxvk {
       return S_FALSE;
     
     try {
+      winehuaFlowTrace(str::format(
+        "d3d11-create-texture2d begin size=", desc.Width, "x", desc.Height,
+        " mips=", desc.MipLevels,
+        " layers=", desc.ArraySize,
+        " format=", uint32_t(desc.Format),
+        " usage=", uint32_t(desc.Usage),
+        " bind=", desc.BindFlags,
+        " cpu=", desc.CPUAccessFlags,
+        " initial=", pInitialData && pInitialData->pSysMem ? 1 : 0));
       Com<D3D11Texture2D> texture = new D3D11Texture2D(this, &desc, nullptr);
+      winehuaFlowTrace("d3d11-create-texture2d object-ready");
       m_initializer->InitTexture(texture->GetCommonTexture(), pInitialData);
       *ppTexture2D = texture.ref();
+      winehuaFlowTrace("d3d11-create-texture2d end");
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
@@ -327,6 +370,10 @@ namespace dxvk {
     const D3D11_SHADER_RESOURCE_VIEW_DESC1* pDesc,
           ID3D11ShaderResourceView1**       ppSRView) {
     InitReturnPtr(ppSRView);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-create-srv begin resource=", pResource,
+      " desc=", pDesc ? 1 : 0));
 
     if (!pResource)
       return E_INVALIDARG;
@@ -484,6 +531,10 @@ namespace dxvk {
           ID3D11RenderTargetView1**         ppRTView) {
     InitReturnPtr(ppRTView);
 
+    winehuaFlowTrace(str::format(
+      "d3d11-create-rtv begin resource=", pResource,
+      " desc=", pDesc ? 1 : 0));
+
     if (!pResource)
       return E_INVALIDARG;
     
@@ -540,6 +591,10 @@ namespace dxvk {
     const D3D11_DEPTH_STENCIL_VIEW_DESC*    pDesc,
           ID3D11DepthStencilView**          ppDepthStencilView) {
     InitReturnPtr(ppDepthStencilView);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-create-dsv begin resource=", pResource,
+      " desc=", pDesc ? 1 : 0));
     
     if (pResource == nullptr)
       return E_INVALIDARG;
@@ -590,6 +645,10 @@ namespace dxvk {
           SIZE_T                      BytecodeLength,
           ID3D11InputLayout**         ppInputLayout) {
     InitReturnPtr(ppInputLayout);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-create-input-layout begin elements=", NumElements,
+      " bytes=", BytecodeLength));
 
     if (pInputElementDescs == nullptr)
       return E_INVALIDARG;
@@ -1158,6 +1217,9 @@ namespace dxvk {
           ID3D11SamplerState**        ppSamplerState) {
     InitReturnPtr(ppSamplerState);
 
+    winehuaFlowTrace(str::format(
+      "d3d11-create-sampler begin desc=", pSamplerDesc ? 1 : 0));
+
     if (pSamplerDesc == nullptr)
       return E_INVALIDARG;
 
@@ -1440,7 +1502,14 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11Device::CheckFormatSupport(
           DXGI_FORMAT Format,
           UINT*       pFormatSupport) {
-    return GetFormatSupportFlags(Format, pFormatSupport, nullptr);
+    winehuaFlowTrace(str::format(
+      "d3d11-check-format begin format=", uint32_t(Format)));
+    const HRESULT hr = GetFormatSupportFlags(Format, pFormatSupport, nullptr);
+    winehuaFlowTrace(str::format(
+      "d3d11-check-format end format=", uint32_t(Format),
+      " hr=", int32_t(hr),
+      " flags=", pFormatSupport ? *pFormatSupport : 0));
+    return hr;
   }
   
   
@@ -1448,7 +1517,16 @@ namespace dxvk {
           DXGI_FORMAT Format,
           UINT        SampleCount,
           UINT*       pNumQualityLevels) {
-    return CheckMultisampleQualityLevels1(Format, SampleCount, 0, pNumQualityLevels);
+    winehuaFlowTrace(str::format(
+      "d3d11-check-msaa begin format=", uint32_t(Format),
+      " samples=", SampleCount));
+    const HRESULT hr = CheckMultisampleQualityLevels1(Format, SampleCount, 0, pNumQualityLevels);
+    winehuaFlowTrace(str::format(
+      "d3d11-check-msaa end format=", uint32_t(Format),
+      " samples=", SampleCount,
+      " hr=", int32_t(hr),
+      " levels=", pNumQualityLevels ? *pNumQualityLevels : 0));
+    return hr;
   }
   
   
@@ -1916,8 +1994,37 @@ namespace dxvk {
     const DxvkDeviceFeatures features
       = GetDeviceFeatures(adapter, featureLevel);
     
-    if (!adapter->checkFeatureSupport(features))
+    if (!adapter->checkFeatureSupport(features)) {
+      if (winehuaRelaxedDriverFeatures()) {
+        const DxvkDeviceFeatures supported = adapter->features();
+#define WINEHUA_LOG_MISSING(section, feature) \
+        if (features.section.feature && !supported.section.feature) \
+          Logger::warn("WineHua: missing Vulkan feature " #feature)
+        WINEHUA_LOG_MISSING(core.features, robustBufferAccess);
+        WINEHUA_LOG_MISSING(core.features, fullDrawIndexUint32);
+        WINEHUA_LOG_MISSING(core.features, imageCubeArray);
+        WINEHUA_LOG_MISSING(core.features, independentBlend);
+        WINEHUA_LOG_MISSING(core.features, geometryShader);
+        WINEHUA_LOG_MISSING(core.features, tessellationShader);
+        WINEHUA_LOG_MISSING(core.features, sampleRateShading);
+        WINEHUA_LOG_MISSING(core.features, dualSrcBlend);
+        WINEHUA_LOG_MISSING(core.features, multiDrawIndirect);
+        WINEHUA_LOG_MISSING(core.features, drawIndirectFirstInstance);
+        WINEHUA_LOG_MISSING(core.features, depthClamp);
+        WINEHUA_LOG_MISSING(core.features, depthBiasClamp);
+        WINEHUA_LOG_MISSING(core.features, fillModeNonSolid);
+        WINEHUA_LOG_MISSING(core.features, multiViewport);
+        WINEHUA_LOG_MISSING(core.features, fragmentStoresAndAtomics);
+        WINEHUA_LOG_MISSING(core.features, shaderImageGatherExtended);
+        WINEHUA_LOG_MISSING(core.features, shaderStorageImageWriteWithoutFormat);
+        WINEHUA_LOG_MISSING(core.features, shaderClipDistance);
+        WINEHUA_LOG_MISSING(core.features, shaderCullDistance);
+        WINEHUA_LOG_MISSING(extHostQueryReset, hostQueryReset);
+        WINEHUA_LOG_MISSING(shaderDrawParameters, shaderDrawParameters);
+#undef WINEHUA_LOG_MISSING
+      }
       return false;
+    }
     
     // TODO also check for required limits
     return true;
@@ -1929,6 +2036,7 @@ namespace dxvk {
           D3D_FEATURE_LEVEL featureLevel) {
     DxvkDeviceFeatures supported = adapter->features();
     DxvkDeviceFeatures enabled   = {};
+    const bool relaxedDriverFeatures = winehuaRelaxedDriverFeatures();
 
     enabled.core.features.geometryShader                          = VK_TRUE;
     enabled.core.features.robustBufferAccess                      = VK_TRUE;
@@ -1964,7 +2072,10 @@ namespace dxvk {
       enabled.core.features.samplerAnisotropy                     = supported.core.features.samplerAnisotropy;
       enabled.core.features.shaderClipDistance                    = VK_TRUE;
       enabled.core.features.shaderCullDistance                    = VK_TRUE;
-      enabled.core.features.textureCompressionBC                  = VK_TRUE;
+      enabled.core.features.textureCompressionBC                  = (relaxedDriverFeatures
+                                                                  || winehuaBcEmulationEnabled())
+                                                                  ? supported.core.features.textureCompressionBC
+                                                                  : VK_TRUE;
       enabled.extDepthClipEnable.depthClipEnable                  = supported.extDepthClipEnable.depthClipEnable;
       enabled.extHostQueryReset.hostQueryReset                    = VK_TRUE;
     }
@@ -1975,7 +2086,9 @@ namespace dxvk {
     
     if (featureLevel >= D3D_FEATURE_LEVEL_9_3) {
       enabled.core.features.independentBlend                      = VK_TRUE;
-      enabled.core.features.multiViewport                         = VK_TRUE;
+      enabled.core.features.multiViewport                         = relaxedDriverFeatures
+                                                                  ? supported.core.features.multiViewport
+                                                                  : VK_TRUE;
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_10_0) {
@@ -1983,12 +2096,18 @@ namespace dxvk {
       enabled.core.features.logicOp                               = supported.core.features.logicOp;
       enabled.core.features.shaderImageGatherExtended             = VK_TRUE;
       enabled.core.features.variableMultisampleRate               = supported.core.features.variableMultisampleRate;
-      enabled.extTransformFeedback.transformFeedback              = VK_TRUE;
-      enabled.extTransformFeedback.geometryStreams                = VK_TRUE;
+      enabled.extTransformFeedback.transformFeedback              = relaxedDriverFeatures
+                                                                  ? supported.extTransformFeedback.transformFeedback
+                                                                  : VK_TRUE;
+      enabled.extTransformFeedback.geometryStreams                = relaxedDriverFeatures
+                                                                  ? supported.extTransformFeedback.geometryStreams
+                                                                  : VK_TRUE;
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_10_1) {
-      enabled.core.features.dualSrcBlend                          = VK_TRUE;
+      enabled.core.features.dualSrcBlend                          = relaxedDriverFeatures
+                                                                  ? supported.core.features.dualSrcBlend
+                                                                  : VK_TRUE;
       enabled.core.features.imageCubeArray                        = VK_TRUE;
     }
     
@@ -2022,6 +2141,10 @@ namespace dxvk {
     if (pClassLinkage != nullptr)
       Logger::warn("D3D11Device::CreateShaderModule: Class linkage not supported");
 
+    winehuaFlowTrace(str::format(
+      "d3d11-shader begin key=", ShaderKey.toString(),
+      " bytes=", BytecodeLength));
+
     D3D11CommonShader commonShader;
 
     HRESULT hr = m_shaderModules.GetShaderModule(this,
@@ -2042,6 +2165,8 @@ namespace dxvk {
       return E_INVALIDARG;
 
     *pShaderModule = std::move(commonShader);
+    winehuaFlowTrace(str::format(
+      "d3d11-shader end key=", ShaderKey.toString(), " hr=", hr));
     return S_OK;
   }
 
@@ -2216,8 +2341,38 @@ namespace dxvk {
         flags2 |= D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
     }
 
-    // Mark everyting as CPU lockable
-    if (flags1 | flags2)
+    #if defined(DXVK_NATIVE_OHOS)
+    const auto packed = LookupPackedFormat(Format, DXGI_VK_FORMAT_MODE_ANY);
+    const bool bcEmulated = imageFormatInfo(packed.Format)->flags.test(DxvkFormatFlag::BlockCompressed)
+      && !fmtProperties->flags.test(DxvkFormatFlag::BlockCompressed);
+
+    if (bcEmulated) {
+      // All decoded BC families have a different backing layout. Do not
+      // advertise CPU or output semantics the texture constructor rejects.
+      flags1 &= ~(D3D11_FORMAT_SUPPORT_BUFFER
+                | D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER
+                | D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER
+                | D3D11_FORMAT_SUPPORT_SO_BUFFER
+                | D3D11_FORMAT_SUPPORT_TEXTURE1D
+                | D3D11_FORMAT_SUPPORT_TEXTURE3D
+                | D3D11_FORMAT_SUPPORT_RENDER_TARGET
+                | D3D11_FORMAT_SUPPORT_BLENDABLE
+                | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN
+                | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT
+                | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET
+                | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE
+                | D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD
+                | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW);
+      flags2 = 0;
+    }
+    #endif
+
+    // Decoded BC images cannot expose a D3D11-compatible mapped layout.
+    if ((flags1 | flags2)
+      #if defined(DXVK_NATIVE_OHOS)
+      && !bcEmulated
+      #endif
+    )
       flags1 |= D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
     
     // Write back format support flags
@@ -2277,6 +2432,9 @@ namespace dxvk {
           void**      ppResource) {
     InitReturnPtr(ppResource);
 
+    #if defined(DXVK_NATIVE_OHOS)
+    return E_NOTIMPL;
+    #else
     if (ppResource == nullptr)
       return S_FALSE;
 
@@ -2322,6 +2480,7 @@ namespace dxvk {
       Logger::err(e.message());
       return E_INVALIDARG;
     }
+    #endif
   }
 
 
@@ -3068,6 +3227,14 @@ namespace dxvk {
     
     if (!ppSwapChain || !pDesc || !hWnd)
       return DXGI_ERROR_INVALID_CALL;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    if (!pFactory || pRestrictToOutput || (pFullscreenDesc && !pFullscreenDesc->Windowed))
+      return DXGI_ERROR_UNSUPPORTED;
+    DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
+    const auto validated = ohos::normalizeSwapchainDesc(hWnd, desc);
+    if (FAILED(validated)) return validated;
+    #else
     
     // Make sure the back buffer size is not zero
     DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
@@ -3075,6 +3242,7 @@ namespace dxvk {
     GetWindowClientSize(hWnd,
       desc.Width  ? nullptr : &desc.Width,
       desc.Height ? nullptr : &desc.Height);
+    #endif
     
     // If necessary, set up a default set of
     // fullscreen parameters for the swap chain
@@ -3101,6 +3269,8 @@ namespace dxvk {
     } catch (const DxvkError& e) {
       Logger::err(e.message());
       return E_INVALIDARG;
+    } catch (const std::bad_alloc&) {
+      return E_OUTOFMEMORY;
     }
   }
   

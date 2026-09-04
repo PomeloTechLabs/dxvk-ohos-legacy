@@ -81,6 +81,7 @@ namespace dxvk {
           IUnknown*             pDevice,
           DXGI_SWAP_CHAIN_DESC* pDesc,
           IDXGISwapChain**      ppSwapChain) {
+    InitReturnPtr(ppSwapChain);
     if (ppSwapChain == nullptr || pDesc == nullptr || pDevice == nullptr)
       return DXGI_ERROR_INVALID_CALL;
     
@@ -125,7 +126,7 @@ namespace dxvk {
     
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
       return DXGI_ERROR_INVALID_CALL;
-    
+
     Com<IWineDXGISwapChainFactory> wineDevice;
     
     if (SUCCEEDED(pDevice->QueryInterface(
@@ -139,8 +140,15 @@ namespace dxvk {
 
       // No ref as that's handled by the object we're wrapping
       // which was ref'ed on creation.
-      if (SUCCEEDED(hr))
+      if (SUCCEEDED(hr)) {
+        #if defined(DXVK_NATIVE_OHOS)
+        // The native COM object already implements IDXGISwapChain4. No
+        // Wine compatibility dispatcher is needed in this same-process path.
+        *ppSwapChain = frontendSwapChain;
+        #else
         *ppSwapChain = new DxgiSwapChainDispatcher(frontendSwapChain);
+        #endif
+      }
 
       return hr;
     }

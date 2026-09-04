@@ -5,28 +5,43 @@ cpu_family = target_machine.cpu_family()
 cpp = meson.get_compiler('cpp')
 cc = meson.get_compiler('c')
 dxvk_is_msvc = cpp.get_id() == 'msvc'
+dxvk_native_ohos = get_option('native_ohos')
 
 compiler_args = [
   '-DNOMINMAX',
   '-D_WIN32_WINNT=0xa00',
-  '-msse',
-  '-msse2',
-  '-msse3',
-  '-mfpmath=sse',
   '-Wimplicit-fallthrough',
   # clang
   '-Wno-unused-private-field',
   '-Wno-microsoft-exception-spec',
 ]
 
-link_args = [
-  '-static',
-  '-static-libgcc',
-  '-static-libstdc++',
-  # We need to set the section alignment for debug symbols to
-  # work properly as well as avoiding a memcpy from the Wine loader.
-  '-Wl,--file-alignment=4096',
-]
+if dxvk_native_ohos
+  compiler_args += [
+    '-DDXVK_NATIVE_OHOS',
+    '-fms-extensions',
+  ]
+else
+  compiler_args += [
+    '-msse',
+    '-msse2',
+    '-msse3',
+    '-mfpmath=sse',
+  ]
+endif
+
+link_args = []
+
+if not dxvk_native_ohos
+  link_args += [
+    '-static',
+    '-static-libgcc',
+    '-static-libstdc++',
+    # We need to set the section alignment for debug symbols to
+    # work properly as well as avoiding a memcpy from the Wine loader.
+    '-Wl,--file-alignment=4096',
+  ]
+endif
 
 # Wine's built-in back traces only work with dwarf2 symbols
 if get_option('debug') and target_machine.system() == 'windows'
@@ -54,32 +69,55 @@ add_project_arguments(cc.get_supported_arguments(compiler_args), language: 'c')
 add_project_link_arguments(cpp.get_supported_link_arguments(link_args), language: 'cpp')
 add_project_link_arguments(cc.get_supported_link_arguments(link_args), language: 'c')
 
-dxvk_include_path = include_directories('./include')
-
-if (cpu_family == 'x86_64')
-  dxvk_library_path = meson.source_root() + '/lib'
+if dxvk_native_ohos
+  dxvk_include_path = include_directories(
+    './include',
+    './include/native',
+    './include/native/windows',
+    './include/native/directx',
+  )
 else
+  dxvk_include_path = include_directories('./include')
+endif
+
+if not dxvk_native_ohos and (cpu_family == 'x86_64')
+  dxvk_library_path = meson.source_root() + '/lib'
+elif not dxvk_native_ohos
   dxvk_library_path = meson.source_root() + '/lib32'
 endif
 
 dxvk_extradep = [ ]
 
-lib_vulkan  = cpp.find_library('vulkan-1', dirs : dxvk_library_path)
-lib_d3d9    = cpp.find_library('d3d9')
-lib_d3d11   = cpp.find_library('d3d11')
-lib_dxgi    = cpp.find_library('dxgi')
-lib_d3dcompiler_43 = cpp.find_library('d3dcompiler_43', dirs : dxvk_library_path)
-
-if dxvk_is_msvc
-  lib_d3dcompiler_47 = cpp.find_library('d3dcompiler')
+if dxvk_native_ohos
+  lib_vulkan          = cpp.find_library('vulkan')
+  lib_native_window   = cpp.find_library('native_window')
+  lib_d3d9            = declare_dependency()
+  lib_d3d11           = declare_dependency()
+  lib_dxgi            = declare_dependency()
+  lib_d3dcompiler_43  = declare_dependency()
+  lib_d3dcompiler_47  = declare_dependency()
 else
-  lib_d3dcompiler_47 = cpp.find_library('d3dcompiler_47')
+  lib_vulkan  = cpp.find_library('vulkan-1', dirs : dxvk_library_path)
+  lib_d3d9    = cpp.find_library('d3d9')
+  lib_d3d11   = cpp.find_library('d3d11')
+  lib_dxgi    = cpp.find_library('dxgi')
+  lib_d3dcompiler_43 = cpp.find_library('d3dcompiler_43', dirs : dxvk_library_path)
+
+  if dxvk_is_msvc
+    lib_d3dcompiler_47 = cpp.find_library('d3dcompiler')
+  else
+    lib_d3dcompiler_47 = cpp.find_library('d3dcompiler_47')
+  endif
 endif
 
 exe_ext = ''
 dll_ext = ''
 
 def_spec_ext = '.def'
+
+if dxvk_native_ohos
+  dxvk_so_version = '0.11003'
+endif
 
 glsl_compiler = find_program('glslangValidator')
 glsl_args = [ '-V', '--vn', '@BASENAME@', '@INPUT@', '-o', '@OUTPUT@' ]
@@ -91,7 +129,14 @@ glsl_generator = generator(glsl_compiler,
   arguments : glsl_args,
 )
 
-if dxvk_is_msvc
+if dxvk_native_ohos
+  res_ext = '.ignored.h'
+  wrc = find_program('touch')
+  wrc_generator = generator(wrc,
+    output    : [ '@BASENAME@' + res_ext ],
+    arguments : [ '@OUTPUT@' ],
+  )
+elif dxvk_is_msvc
   res_ext = '.res'
   wrc = find_program('rc')
   wrc_generator = generator(wrc,

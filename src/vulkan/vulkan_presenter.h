@@ -11,6 +11,10 @@
 
 #include "vulkan_loader.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+#include "../wsi/ohos_window_registry.h"
+#endif
+
 namespace dxvk::vk {
 
   /**
@@ -124,13 +128,16 @@ namespace dxvk::vk {
      * If this returns an error, the swap chain
      * must be recreated and a new image must
      * be acquired before proceeding.
+     * Native OHOS VK_TIMEOUT/VK_NOT_READY are retryable on the next frame;
+     * they do not require swapchain recreation or signal the acquire semaphore.
      * \param [out] sync Synchronization semaphores
      * \param [out] index Acquired image index
      * \returns Status of the operation
      */
     VkResult acquireNextImage(
             PresenterSync&  sync,
-            uint32_t&       index);
+            uint32_t&       index,
+            bool            nonBlocking = false);
     
     /**
      * \brief Presents current image
@@ -189,17 +196,28 @@ namespace dxvk::vk {
     Rc<DeviceFn>      m_vkd;
 
     PresenterDevice   m_device;
-    PresenterInfo     m_info;
+    PresenterInfo     m_info = { };
 
     HWND              m_window      = nullptr;
     VkSurfaceKHR      m_surface     = VK_NULL_HANDLE;
     VkSwapchainKHR    m_swapchain   = VK_NULL_HANDLE;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    // Retained until after swapchain and surface destruction. The caller must
+    // drain GPU submissions before recreating/destroying this Presenter.
+    std::shared_ptr<ohos::WindowState> m_nativeWindow;
+    uint64_t m_windowRevision = 0;
+
+    VkResult createNativeSurface(void* window);
+    VkResult checkNativeWindow(const ohos::WindowLease& lease) const;
+    #endif
 
     std::vector<PresenterImage> m_images;
     std::vector<PresenterSync>  m_semaphores;
 
     uint32_t m_imageIndex = 0;
     uint32_t m_frameIndex = 0;
+    uint64_t m_winehuaPresentSequence = 0;
 
     VkResult m_acquireStatus = VK_NOT_READY;
 

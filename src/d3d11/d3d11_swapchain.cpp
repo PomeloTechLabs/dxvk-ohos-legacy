@@ -2,6 +2,11 @@
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+#include "../dxgi/dxgi_ohos_swapchain.h"
+#include "../wsi/ohos_present_policy.h"
+#endif
+
 namespace dxvk {
 
   static uint16_t MapGammaControlPoint(float x) {
@@ -23,20 +28,34 @@ namespace dxvk {
     m_device    (pDevice->GetDXVKDevice()),
     m_context   (m_device->createContext()),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
-    CreateFrameLatencyEvent();
+    try {
+      CreateFrameLatencyEvent();
 
-    if (!pDevice->GetOptions()->deferSurfaceCreation)
-      CreatePresenter();
+      if (!pDevice->GetOptions()->deferSurfaceCreation)
+        CreatePresenter();
     
-    CreateBackBuffer();
-    CreateBlitter();
-    CreateHud();
+      CreateBackBuffer();
+      CreateBlitter();
+      CreateHud();
+    } catch (...) {
+      m_device->waitForIdle();
+      DestroyFrameLatencyEvent();
+      throw;
+    }
   }
 
 
   D3D11SwapChain::~D3D11SwapChain() {
     m_device->waitForSubmission(&m_presentStatus);
     m_device->waitForIdle();
+
+    #if defined(DXVK_NATIVE_OHOS)
+    // The blit context retains image views/framebuffer state. Release it
+    // before Presenter destroys the images owned by the Vulkan swapchain.
+    m_context = nullptr;
+    m_imageViews.clear();
+    m_presenter = nullptr;
+    #endif
     
     DestroyFrameLatencyEvent();
   }
@@ -115,6 +134,31 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::ChangeProperties(
     const DXGI_SWAP_CHAIN_DESC1*  pDesc) {
 
+    if (!pDesc) return E_INVALIDARG;
+    #if defined(DXVK_NATIVE_OHOS)
+    const auto oldDesc = m_desc;
+    const bool oldDirty = m_dirty;
+    const auto oldBuffer = m_backBuffer;
+    const auto oldImage = m_swapImage;
+    const auto oldView = m_swapImageView;
+    const auto oldContext = m_context;
+    try {
+      m_context = m_device->createContext();
+      m_desc = *pDesc;
+      CreateBackBuffer();
+      m_dirty = true;
+      return S_OK;
+    } catch (...) {
+      m_desc = oldDesc;
+      m_dirty = oldDirty;
+      m_backBuffer = oldBuffer;
+      m_swapImage = oldImage;
+      m_swapImageView = oldView;
+      m_context = oldContext;
+      throw;
+    }
+    #else
+
     m_dirty |= m_desc.Format      != pDesc->Format
             || m_desc.Width       != pDesc->Width
             || m_desc.Height      != pDesc->Height
@@ -124,6 +168,7 @@ namespace dxvk {
     m_desc = *pDesc;
     CreateBackBuffer();
     return S_OK;
+    #endif
   }
 
 
@@ -174,6 +219,7 @@ namespace dxvk {
     if (MaxLatency == 0 || MaxLatency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
       return DXGI_ERROR_INVALID_CALL;
 
+    #if !defined(DXVK_NATIVE_OHOS)
     if (m_frameLatencyEvent) {
       // Windows DXGI does not seem to handle the case where the new maximum
       // latency is less than the current value, and some games relying on
@@ -182,6 +228,7 @@ namespace dxvk {
       if (MaxLatency > m_frameLatency)
         ReleaseSemaphore(m_frameLatencyEvent, MaxLatency - m_frameLatency, nullptr);
     }
+    #endif
 
     m_frameLatency = MaxLatency;
     return S_OK;
@@ -192,6 +239,40 @@ namespace dxvk {
           UINT                      SyncInterval,
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+    #if defined(DXVK_NATIVE_OHOS)
+    try {
+      if (PresentFlags & ~(DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT))
+        return DXGI_ERROR_UNSUPPORTED;
+      if (pPresentParameters && (pPresentParameters->DirtyRectsCount
+       || pPresentParameters->pScrollRect || pPresentParameters->pScrollOffset))
+        return DXGI_ERROR_UNSUPPORTED;
+      if (m_device->getDeviceStatus() != VK_SUCCESS)
+        return DXGI_ERROR_DEVICE_REMOVED;
+      DXVKOhosWindowInfo window = { };
+      const auto windowStatus = ohos::windowInfo(m_window, window);
+      if (FAILED(windowStatus)) return windowStatus;
+      if (!window.width || !window.height) return DXGI_STATUS_OCCLUDED;
+      if (PresentFlags & DXGI_PRESENT_TEST) return S_OK;
+
+      const auto options = m_parent->GetOptions();
+      if (options->syncInterval >= 0) SyncInterval = options->syncInterval;
+      const bool vsync = SyncInterval != 0;
+      m_dirty |= vsync != m_vsync;
+      m_vsync = vsync;
+      if (m_presenter == nullptr) CreatePresenter();
+      if (!m_presenter->hasSwapChain() || m_dirty) {
+        const auto rebuilt = RecreateSwapChain(m_vsync);
+        if (rebuilt != VK_SUCCESS) return ohos::presentResult(rebuilt);
+        m_dirty = false;
+      }
+      return PresentImage(SyncInterval, PresentFlags);
+    } catch (const std::bad_alloc&) {
+      return E_OUTOFMEMORY;
+    } catch (const DxvkError& error) {
+      Logger::err(error.message());
+      return DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+    }
+    #else
     auto options = m_parent->GetOptions();
 
     if (options->syncInterval >= 0)
@@ -227,13 +308,14 @@ namespace dxvk {
       RecreateSwapChain(m_vsync);
     
     try {
-      PresentImage(SyncInterval);
+      hr = PresentImage(SyncInterval, PresentFlags);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
       hr = E_FAIL;
     }
 
     return hr;
+    #endif
   }
 
 
@@ -253,7 +335,7 @@ namespace dxvk {
   }
 
 
-  HRESULT D3D11SwapChain::PresentImage(UINT SyncInterval) {
+  HRESULT D3D11SwapChain::PresentImage(UINT SyncInterval, UINT PresentFlags) {
     Com<ID3D11DeviceContext> deviceContext = nullptr;
     m_parent->GetImmediateContext(&deviceContext);
 
@@ -262,10 +344,19 @@ namespace dxvk {
     immediateContext->Flush();
 
     // Bump our frame id.
+    #if !defined(DXVK_NATIVE_OHOS)
     ++m_frameId;
+    #endif
     
     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
-      SynchronizePresent();
+      #if defined(DXVK_NATIVE_OHOS)
+      if ((PresentFlags & DXGI_PRESENT_DO_NOT_WAIT) && m_presentStatus.result.load() == VK_NOT_READY)
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+      #endif
+      const auto synchronized = SynchronizePresent();
+      #if defined(DXVK_NATIVE_OHOS)
+      if (synchronized != VK_SUCCESS) return ohos::presentResult(synchronized);
+      #endif
 
       if (!m_presenter->hasSwapChain())
         return DXGI_STATUS_OCCLUDED;
@@ -276,8 +367,27 @@ namespace dxvk {
 
       uint32_t imageIndex = 0;
 
+      #if defined(DXVK_NATIVE_OHOS)
+      // The acquire semaphore is frame-indexed. Its previous GPU wait must
+      // finish before it can be passed to vkAcquireNextImageKHR again.
+      const bool nonBlocking = PresentFlags & DXGI_PRESENT_DO_NOT_WAIT;
+      const auto inFlight = std::min(info.imageCount, GetActualFrameLatency());
+      if (inFlight && m_frameId >= inFlight) {
+        const auto ready = WaitForNativeFrame(m_frameId - inFlight + 1, nonBlocking);
+        if (ready != S_OK) return ready;
+      }
+      const auto status = ohos::acquireForPresent(!nonBlocking,
+        [&] { return m_presenter->acquireNextImage(sync, imageIndex, nonBlocking); },
+        [&] { return RecreateSwapChain(m_vsync); },
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
+      if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
+        return ohos::presentResult(status);
+      info = m_presenter->info();
+      // Count only frames actually submitted; timeouts must not leave holes
+      // in the frame-latency fence's sequence.
+      ++m_frameId;
+      #else
       VkResult status = m_presenter->acquireNextImage(sync, imageIndex);
-
       while (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR) {
         RecreateSwapChain(m_vsync);
 
@@ -287,6 +397,7 @@ namespace dxvk {
         info = m_presenter->info();
         status = m_presenter->acquireNextImage(sync, imageIndex);
       }
+      #endif
 
       // Resolve back buffer if it is multisampled. We
       // only have to do it only for the first frame.
@@ -300,21 +411,44 @@ namespace dxvk {
       if (m_hud != nullptr)
         m_hud->render(m_context, info.format, info.imageExtent);
       
+      #if !defined(DXVK_NATIVE_OHOS)
       if (i + 1 >= SyncInterval)
+      #endif
         m_context->signal(m_frameLatencySignal, m_frameId);
 
-      SubmitPresent(immediateContext, sync, i);
+      const bool lastPresent = i + 1 >= std::max(SyncInterval, 1u);
+      SubmitPresent(immediateContext, sync, i,
+        lastPresent ? m_frameId + 1 : 0);
     }
 
+    #if !defined(DXVK_NATIVE_OHOS)
     SyncFrameLatency();
+    #endif
     return S_OK;
   }
+
+
+  #if defined(DXVK_NATIVE_OHOS)
+  HRESULT D3D11SwapChain::WaitForNativeFrame(uint64_t frame, bool nonBlocking) {
+    if (m_frameLatencySignal->value() >= frame) return S_OK;
+    if (nonBlocking) return DXGI_ERROR_WAS_STILL_DRAWING;
+    while (!m_frameLatencySignal->waitFor(frame, std::chrono::milliseconds(16))) {
+      if (m_device->getDeviceStatus() != VK_SUCCESS) return DXGI_ERROR_DEVICE_REMOVED;
+      DXVKOhosWindowInfo window = { };
+      const auto status = ohos::windowInfo(m_window, window);
+      if (FAILED(status)) return status;
+      if (!window.width || !window.height) return DXGI_STATUS_OCCLUDED;
+    }
+    return S_OK;
+  }
+  #endif
 
 
   void D3D11SwapChain::SubmitPresent(
           D3D11ImmediateContext*  pContext,
     const vk::PresenterSync&      Sync,
-          uint32_t                FrameId) {
+          uint32_t                FrameId,
+          uint64_t                NextFrameId) {
     auto lock = pContext->LockContext();
 
     // Present from CS thread so that we don't
@@ -323,6 +457,7 @@ namespace dxvk {
 
     pContext->EmitCs([this,
       cFrameId     = FrameId,
+      cNextFrameId = NextFrameId,
       cSync        = Sync,
       cHud         = m_hud,
       cCommandList = m_context->endRecording()
@@ -334,26 +469,38 @@ namespace dxvk {
         cHud->update();
 
       m_device->presentImage(m_presenter, &m_presentStatus);
+
+      if (cNextFrameId)
+        ctx->winehuaFrameBoundary(cNextFrameId);
     });
 
     pContext->FlushCsChunk();
   }
 
 
-  void D3D11SwapChain::SynchronizePresent() {
+  VkResult D3D11SwapChain::SynchronizePresent() {
     // Recreate swap chain if the previous present call failed
     VkResult status = m_device->waitForSubmission(&m_presentStatus);
     
-    if (status != VK_SUCCESS)
-      RecreateSwapChain(m_vsync);
+    #if defined(DXVK_NATIVE_OHOS)
+    if (status == VK_ERROR_DEVICE_LOST) return status;
+    if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR
+     && status != VK_ERROR_OUT_OF_DATE_KHR && status != VK_ERROR_SURFACE_LOST_KHR)
+      return status;
+    #endif
+    return status != VK_SUCCESS ? RecreateSwapChain(m_vsync) : VK_SUCCESS;
   }
 
 
-  void D3D11SwapChain::RecreateSwapChain(BOOL Vsync) {
+  VkResult D3D11SwapChain::RecreateSwapChain(BOOL Vsync) {
     // Ensure that we can safely destroy the swap chain
     m_device->waitForSubmission(&m_presentStatus);
     m_device->waitForIdle();
 
+    #if defined(DXVK_NATIVE_OHOS)
+    m_context = m_device->createContext();
+    m_imageViews.clear();
+    #endif
     m_presentStatus.result = VK_SUCCESS;
 
     vk::PresenterDesc presenterDesc;
@@ -363,18 +510,26 @@ namespace dxvk {
     presenterDesc.numPresentModes = PickPresentModes(Vsync, presenterDesc.presentModes);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
-    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)
+    const auto status = m_presenter->recreateSwapChain(presenterDesc);
+    #if defined(DXVK_NATIVE_OHOS)
+    if (status != VK_SUCCESS) return status;
+    #else
+    if (status != VK_SUCCESS)
       throw DxvkError("D3D11SwapChain: Failed to recreate swap chain");
+    #endif
     
     CreateRenderTargetViews();
+    return VK_SUCCESS;
   }
 
 
   void D3D11SwapChain::CreateFrameLatencyEvent() {
     m_frameLatencySignal = new sync::CallbackFence(m_frameId);
 
+    #if !defined(DXVK_NATIVE_OHOS)
     if (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
       m_frameLatencyEvent = CreateSemaphore(nullptr, m_frameLatency, DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
+    #endif
   }
 
 
@@ -542,7 +697,9 @@ namespace dxvk {
 
 
   void D3D11SwapChain::DestroyFrameLatencyEvent() {
+    #if !defined(DXVK_NATIVE_OHOS)
     CloseHandle(m_frameLatencyEvent);
+    #endif
   }
 
 
@@ -550,11 +707,13 @@ namespace dxvk {
     // Wait for the sync event so that we respect the maximum frame latency
     m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
 
+    #if !defined(DXVK_NATIVE_OHOS)
     if (m_frameLatencyEvent) {
       m_frameLatencySignal->setCallback(m_frameId, [cFrameLatencyEvent = m_frameLatencyEvent] () {
         ReleaseSemaphore(cFrameLatencyEvent, 1, nullptr);
       });
     }
+    #endif
   }
 
 

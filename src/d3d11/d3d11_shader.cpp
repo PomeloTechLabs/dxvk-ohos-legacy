@@ -1,5 +1,6 @@
 #include "d3d11_device.h"
 #include "d3d11_shader.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -70,6 +71,8 @@ namespace dxvk {
       
       m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, memFlags);
       std::memcpy(m_buffer->mapPtr(0), shaderInfo.uniformData, shaderInfo.uniformSize);
+      if (winehuaFlushDynamicMapped())
+        m_buffer->flushMappedSlice(m_buffer->getSliceHandle());
     }
 
     pDevice->GetDXVKDevice()->registerShader(m_shader);

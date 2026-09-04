@@ -4,6 +4,8 @@ namespace dxvk {
 
   constexpr uint32_t Icb_BindingSlotId   = 14;
   constexpr uint32_t Icb_MaxBakedDwords  = 16;
+  constexpr uint32_t SamplerEmulationBindingSlotId = 15;
+  constexpr uint32_t SamplerEmulationVectorCount   = 32;
   
   constexpr uint32_t PerVertex_Position  = 0;
   constexpr uint32_t PerVertex_CullDist  = 1;
@@ -849,6 +851,15 @@ namespace dxvk {
     // dclSampler takes one operand:
     //    (dst0) The sampler register to declare
     const uint32_t samplerId = ins.dst[0].idx[0].offset;
+
+    if (m_moduleInfo.options.emulateCustomBorderColor
+     && !m_constantBuffers.at(SamplerEmulationBindingSlotId).varId) {
+      this->emitDclConstantBufferVar(
+        SamplerEmulationBindingSlotId,
+        SamplerEmulationVectorCount,
+        "winehua_sampler_info",
+        false);
+    }
     
     // The sampler type is opaque, but we still have to
     // define a pointer and a variable in oder to use it
@@ -868,11 +879,17 @@ namespace dxvk {
     // Compute binding slot index for the sampler
     uint32_t bindingId = computeSamplerBinding(
       m_programInfo.type(), samplerId);
+    m_samplers.at(samplerId).bindingId = bindingId;
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
     
-    // Store descriptor info for the shader interface
+    // Store descriptor info for the shader interface. In the opt-in
+    // WineHua compatibility mode the sampler is consumed through a
+    // combined image sampler generated when the texture is first sampled.
+    if (m_moduleInfo.options.useCombinedImageSampler)
+      return;
+
     DxvkResourceSlot resource;
     resource.slot = bindingId;
     resource.type = VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -938,7 +955,21 @@ namespace dxvk {
     
     // Declare the resource type
     const uint32_t sampledTypeId = getScalarTypeId(sampledType);
-    const DxbcImageInfo typeInfo = getResourceType(resourceType, isUav);    
+    DxbcImageInfo typeInfo = getResourceType(resourceType, isUav);
+    const bool emulateCubeArrayDref =
+      !isUav
+      && resourceType == DxbcResourceDim::TextureCubeArr
+      && m_moduleInfo.options.emulateCubeArrayDref
+      && m_analysis->srvInfos[registerId].accessCubeArrayDref;
+
+    if (emulateCubeArrayDref) {
+      typeInfo.dim = spv::Dim2D;
+      typeInfo.array = 1;
+      typeInfo.vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      Logger::info(str::format(
+        "WineHua: t", registerId,
+        " CubeArray Dref uses shader-side 2D-array emulation"));
+    }
     
     // Declare additional capabilities if necessary
     switch (resourceType) {
@@ -983,6 +1014,44 @@ namespace dxvk {
     const uint32_t imageTypeId = m_module.defImageType(sampledTypeId,
       typeInfo.dim, 0, typeInfo.array, typeInfo.ms, typeInfo.sampled,
       imageFormat);
+
+    // Compute the DXVK binding slot index for the resource.
+    // D3D11 needs to bind the actual resource to this slot.
+    uint32_t bindingId = isUav
+      ? computeUavBinding(m_programInfo.type(), registerId)
+      : computeSrvBinding(m_programInfo.type(), registerId);
+
+    /* In the opt-in WineHua compatibility mode sampled resources are
+     * declared lazily as combined image samplers from emitLoadSampledImage.
+     * This keeps the shader interface free of a separated image descriptor,
+     * which is the path currently returning zero on the target Venus stack. */
+    if (!isUav && m_moduleInfo.options.useCombinedImageSampler) {
+      DxbcShaderResource res;
+      res.type          = DxbcResourceType::Typed;
+      res.imageInfo     = typeInfo;
+      res.varId         = 0;
+      res.specId        = 0;
+      res.bindingId     = bindingId;
+      res.sampledType   = sampledType;
+      res.sampledTypeId = sampledTypeId;
+      res.imageTypeId   = imageTypeId;
+      res.colorTypeId   = imageTypeId;
+      res.depthTypeId   = 0;
+      res.emulateCubeArrayDref = emulateCubeArrayDref;
+
+      if ((sampledType == DxbcScalarType::Float32)
+       && (resourceType == DxbcResourceDim::Texture2D
+        || resourceType == DxbcResourceDim::Texture2DArr
+        || resourceType == DxbcResourceDim::TextureCube
+        || resourceType == DxbcResourceDim::TextureCubeArr)) {
+        res.depthTypeId = m_module.defImageType(sampledTypeId,
+          typeInfo.dim, 1, typeInfo.array, typeInfo.ms, typeInfo.sampled,
+          spv::ImageFormatUnknown);
+      }
+
+      m_textures.at(registerId) = res;
+      return;
+    }
     
     // We'll declare the texture variable with the color type
     // and decide which one to use when the texture is sampled.
@@ -994,12 +1063,6 @@ namespace dxvk {
     
     m_module.setDebugName(varId,
       str::format(isUav ? "u" : "t", registerId).c_str());
-    
-    // Compute the DXVK binding slot index for the resource.
-    // D3D11 needs to bind the actual resource to this slot.
-    uint32_t bindingId = isUav
-      ? computeUavBinding(m_programInfo.type(), registerId)
-      : computeSrvBinding(m_programInfo.type(), registerId);
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
@@ -1033,11 +1096,13 @@ namespace dxvk {
       res.imageInfo     = typeInfo;
       res.varId         = varId;
       res.specId        = specConstId;
+      res.bindingId     = bindingId;
       res.sampledType   = sampledType;
       res.sampledTypeId = sampledTypeId;
       res.imageTypeId   = imageTypeId;
       res.colorTypeId   = imageTypeId;
       res.depthTypeId   = 0;
+      res.emulateCubeArrayDref = emulateCubeArrayDref;
       res.structStride  = 0;
       res.structAlign   = 0;
       
@@ -1191,6 +1256,7 @@ namespace dxvk {
       res.imageInfo     = typeInfo;
       res.varId         = varId;
       res.specId        = specConstId;
+      res.bindingId     = bindingId;
       res.sampledType   = sampledType;
       res.sampledTypeId = sampledTypeId;
       res.imageTypeId   = resTypeId;
@@ -1775,7 +1841,7 @@ namespace dxvk {
           ins.op));
         return;
     }
-    
+
     if (ins.controls.precise() || m_precise)
       m_module.decorate(dst.id, spv::DecorationNoContraction);
     
@@ -3228,12 +3294,16 @@ namespace dxvk {
     const DxbcRegister& samplerReg  = ins.src[2];
     
     // Texture and sampler register IDs
-    const auto& texture = m_textures.at(textureReg.idx[0].offset);
-    const auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
+    auto& texture = m_textures.at(textureReg.idx[0].offset);
+    auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
     
     // Load texture coordinates
-    const DxbcRegisterValue coord = emitRegisterLoad(texCoordReg,
-      DxbcRegMask::firstN(getTexLayerDim(texture.imageInfo)));
+    DxbcRegisterValue coord = texture.emulateCubeArrayDref
+      ? emitRegisterLoad(texCoordReg, DxbcRegMask::firstN(4))
+      : emitRegisterLoad(texCoordReg,
+          DxbcRegMask::firstN(getTexLayerDim(texture.imageInfo)));
+    if (texture.emulateCubeArrayDref)
+      coord = emitCubeArrayTo2DArrayCoord(coord);
     
     // Query the LOD. The result is a two-dimensional float32
     // vector containing the mip level and virtual LOD numbers.
@@ -3354,7 +3424,7 @@ namespace dxvk {
     //    (src0) Source address
     //    (src1) Source texture
     //    (src2) Sample number
-    const auto& texture = m_textures.at(ins.src[1].idx[0].offset);
+    auto& texture = m_textures.at(ins.src[1].idx[0].offset);
     const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
     
     // Load the texture coordinates. The last component
@@ -3412,7 +3482,15 @@ namespace dxvk {
     
     // Reading a typed image or buffer view
     // always returns a four-component vector.
-    const uint32_t imageId = m_module.opLoad(texture.imageTypeId, texture.varId);
+    /* A combined descriptor is represented by OpTypeSampledImage.  DXBC
+     * ld/ld2ms has no sampler operand, so extract the image component before
+     * emitting OpImageFetch.  The old path loaded an image-only variable that
+     * is deliberately not declared in combined mode, producing an invalid
+     * SPIR-V id 0 and a device/ring hang on Venus. */
+    const uint32_t imageId = m_moduleInfo.options.useCombinedImageSampler
+      ? m_module.opImage(texture.imageTypeId,
+          emitLoadCombinedImage(texture, false))
+      : m_module.opLoad(texture.imageTypeId, texture.varId);
     
     DxbcRegisterValue result;
     result.type.ctype  = texture.sampledType;
@@ -3461,15 +3539,19 @@ namespace dxvk {
     const DxbcRegister& samplerReg  = ins.src[2 + isExtendedGather];
     
     // Texture and sampler register IDs
-    const auto& texture = m_textures.at(textureReg.idx[0].offset);
-    const auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
+    auto& texture = m_textures.at(textureReg.idx[0].offset);
+    auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
     
     // Image type, which stores the image dimensions etc.
     const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
     
     // Load the texture coordinates. SPIR-V allows these
     // to be float4 even if not all components are used.
-    DxbcRegisterValue coord = emitLoadTexCoord(texCoordReg, texture.imageInfo);
+    DxbcRegisterValue coord = texture.emulateCubeArrayDref
+      ? emitRegisterLoad(texCoordReg, DxbcRegMask::firstN(4))
+      : emitLoadTexCoord(texCoordReg, texture.imageInfo);
+    if (texture.emulateCubeArrayDref)
+      coord = emitCubeArrayTo2DArrayCoord(coord);
     
     // Load reference value for depth-compare operations
     const bool isDepthCompare = ins.op == DxbcOpcode::Gather4C
@@ -3536,7 +3618,7 @@ namespace dxvk {
           ins.op));
         return;
     }
-    
+
     // Swizzle components using the texture swizzle
     // and the destination operand's write mask
     result = emitRegisterSwizzle(result,
@@ -3565,13 +3647,17 @@ namespace dxvk {
     const DxbcRegister& samplerReg  = ins.src[2];
     
     // Texture and sampler register IDs
-    const auto& texture = m_textures.at(textureReg.idx[0].offset);
-    const auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
+    auto& texture = m_textures.at(textureReg.idx[0].offset);
+    auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
     const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
     
     // Load the texture coordinates. SPIR-V allows these
     // to be float4 even if not all components are used.
-    DxbcRegisterValue coord = emitLoadTexCoord(texCoordReg, texture.imageInfo);
+    DxbcRegisterValue coord = texture.emulateCubeArrayDref
+      ? emitRegisterLoad(texCoordReg, DxbcRegMask::firstN(4))
+      : emitLoadTexCoord(texCoordReg, texture.imageInfo);
+    if (texture.emulateCubeArrayDref)
+      coord = emitCubeArrayTo2DArrayCoord(coord);
     
     // Load reference value for depth-compare operations
     const bool isDepthCompare = ins.op == DxbcOpcode::SampleC
@@ -3580,6 +3666,20 @@ namespace dxvk {
     const DxbcRegisterValue referenceValue = isDepthCompare
       ? emitRegisterLoad(ins.src[3], DxbcRegMask(true, false, false, false))
       : DxbcRegisterValue();
+
+    /* SPIR-V permits Cube Dref coordinates to carry more than the minimum
+     * three components. Maleoon's fragment compiler returns an all-one
+     * comparison result for the minimal vec3 representation, while the
+     * equivalent vec4(direction, dref) representation is correct. Keep this
+     * adapter quirk narrow to pixel shaders and non-array Cube comparison
+     * samples; CubeArray has a distinct coordinate contract. */
+    DxbcRegisterValue depthCompareCoord = coord;
+    if (isDepthCompare
+     && m_moduleInfo.options.padCubeDrefCoordinates
+     && m_programInfo.type() == DxbcProgramType::PixelShader
+     && texture.imageInfo.dim == spv::DimCube
+     && !texture.imageInfo.array)
+      depthCompareCoord = emitRegisterConcat(coord, referenceValue);
     
     // Load explicit gradients for sample operations that require them
     const bool hasExplicitGradients = ins.op == DxbcOpcode::SampleD;
@@ -3638,7 +3738,7 @@ namespace dxvk {
       // Depth-compare operation
       case DxbcOpcode::SampleC: {
         result.id = m_module.opImageSampleDrefImplicitLod(
-          getVectorTypeId(result.type), sampledImageId, coord.id,
+          getVectorTypeId(result.type), sampledImageId, depthCompareCoord.id,
           referenceValue.id, imageOperands);
       } break;
       
@@ -3648,7 +3748,7 @@ namespace dxvk {
         imageOperands.sLod = m_module.constf32(0.0f);
         
         result.id = m_module.opImageSampleDrefExplicitLod(
-          getVectorTypeId(result.type), sampledImageId, coord.id,
+          getVectorTypeId(result.type), sampledImageId, depthCompareCoord.id,
           referenceValue.id, imageOperands);
       } break;
       
@@ -3688,6 +3788,20 @@ namespace dxvk {
           "DxbcCompiler: Unhandled instruction: ",
           ins.op));
         return;
+    }
+
+    if (m_moduleInfo.options.emulateCustomBorderColor
+     && ins.op == DxbcOpcode::SampleL
+     && !isDepthCompare
+     && texture.sampledType == DxbcScalarType::Float32
+     && !texture.imageInfo.array
+     && texture.imageInfo.dim != spv::DimCube
+     && ins.sampleControls.u == 0
+     && ins.sampleControls.v == 0
+     && ins.sampleControls.w == 0) {
+      result = emitCustomBorderColorCorrection(
+        result, coord, textureReg, texture,
+        samplerReg.idx[0].offset, lod);
     }
     
     // Swizzle components using the texture swizzle
@@ -4670,6 +4784,99 @@ namespace dxvk {
       : m_module.opINotEqual(typeId, value.id, zeroId);
     return result;
   }
+
+
+  DxbcRegisterValue DxbcCompiler::emitCubeArrayTo2DArrayCoord(
+          DxbcRegisterValue       coord) {
+    const DxbcVectorType floatType = { DxbcScalarType::Float32, 1 };
+    const DxbcVectorType boolType = { DxbcScalarType::Bool, 1 };
+    const uint32_t tFloat = getVectorTypeId(floatType);
+    const uint32_t tBool = getVectorTypeId(boolType);
+
+    const DxbcRegisterValue x =
+      emitRegisterExtract(coord, DxbcRegMask(true, false, false, false));
+    const DxbcRegisterValue y =
+      emitRegisterExtract(coord, DxbcRegMask(false, true, false, false));
+    const DxbcRegisterValue z =
+      emitRegisterExtract(coord, DxbcRegMask(false, false, true, false));
+    const DxbcRegisterValue cube =
+      emitRegisterExtract(coord, DxbcRegMask(false, false, false, true));
+    const DxbcRegisterValue ax = emitRegisterAbsolute(x);
+    const DxbcRegisterValue ay = emitRegisterAbsolute(y);
+    const DxbcRegisterValue az = emitRegisterAbsolute(z);
+    const DxbcRegisterValue negX = emitRegisterNegate(x);
+    const DxbcRegisterValue negY = emitRegisterNegate(y);
+    const DxbcRegisterValue negZ = emitRegisterNegate(z);
+    const uint32_t zero = m_module.constf32(0.0f);
+
+    const uint32_t xMajor = m_module.opLogicalAnd(tBool,
+      m_module.opFOrdGreaterThanEqual(tBool, ax.id, ay.id),
+      m_module.opFOrdGreaterThanEqual(tBool, ax.id, az.id));
+    const uint32_t yMajor = m_module.opLogicalAnd(tBool,
+      m_module.opLogicalNot(tBool, xMajor),
+      m_module.opFOrdGreaterThanEqual(tBool, ay.id, az.id));
+    const uint32_t xPositive =
+      m_module.opFOrdGreaterThanEqual(tBool, x.id, zero);
+    const uint32_t yPositive =
+      m_module.opFOrdGreaterThanEqual(tBool, y.id, zero);
+    const uint32_t zPositive =
+      m_module.opFOrdGreaterThanEqual(tBool, z.id, zero);
+
+    const auto selectFloat = [this, tFloat](
+            uint32_t condition,
+            uint32_t whenTrue,
+            uint32_t whenFalse) {
+      return m_module.opSelect(tFloat, condition, whenTrue, whenFalse);
+    };
+
+    const uint32_t scX = selectFloat(xPositive, negZ.id, z.id);
+    const uint32_t tcX = negY.id;
+    const uint32_t faceX = selectFloat(
+      xPositive, m_module.constf32(0.0f), m_module.constf32(1.0f));
+
+    const uint32_t scY = x.id;
+    const uint32_t tcY = selectFloat(yPositive, z.id, negZ.id);
+    const uint32_t faceY = selectFloat(
+      yPositive, m_module.constf32(2.0f), m_module.constf32(3.0f));
+
+    const uint32_t scZ = selectFloat(zPositive, x.id, negX.id);
+    const uint32_t tcZ = negY.id;
+    const uint32_t faceZ = selectFloat(
+      zPositive, m_module.constf32(4.0f), m_module.constf32(5.0f));
+
+    const uint32_t sc = selectFloat(xMajor, scX,
+      selectFloat(yMajor, scY, scZ));
+    const uint32_t tc = selectFloat(xMajor, tcX,
+      selectFloat(yMajor, tcY, tcZ));
+    const uint32_t major = selectFloat(xMajor, ax.id,
+      selectFloat(yMajor, ay.id, az.id));
+    const uint32_t face = selectFloat(xMajor, faceX,
+      selectFloat(yMajor, faceY, faceZ));
+
+    const uint32_t one = m_module.constf32(1.0f);
+    const uint32_t half = m_module.constf32(0.5f);
+    const uint32_t u = m_module.opFMul(tFloat,
+      m_module.opFAdd(tFloat, m_module.opFDiv(tFloat, sc, major), one),
+      half);
+    const uint32_t v = m_module.opFMul(tFloat,
+      m_module.opFAdd(tFloat, m_module.opFDiv(tFloat, tc, major), one),
+      half);
+
+    /* Vulkan selects an array layer using floor(layer + 0.5). Preserve that
+     * rule before converting the cube index to its six face layers. */
+    const uint32_t roundedCube = m_module.opFloor(tFloat,
+      m_module.opFAdd(tFloat, cube.id, half));
+    const uint32_t layer = m_module.opFAdd(tFloat,
+      m_module.opFMul(tFloat, roundedCube, m_module.constf32(6.0f)),
+      face);
+    const std::array<uint32_t, 3> components = {{ u, v, layer }};
+
+    DxbcRegisterValue result;
+    result.type = { DxbcScalarType::Float32, 3 };
+    result.id = m_module.opCompositeConstruct(
+      getVectorTypeId(result.type), components.size(), components.data());
+    return result;
+  }
   
   
   DxbcRegisterValue DxbcCompiler::emitRegisterMaskBits(
@@ -4742,9 +4949,12 @@ namespace dxvk {
 
 
   uint32_t DxbcCompiler::emitLoadSampledImage(
-    const DxbcShaderResource&     textureResource,
-    const DxbcSampler&            samplerResource,
+          DxbcShaderResource&     textureResource,
+          DxbcSampler&            samplerResource,
           bool                    isDepthCompare) {
+    if (m_moduleInfo.options.useCombinedImageSampler)
+      return emitLoadCombinedImage(textureResource, isDepthCompare);
+
     const uint32_t sampledImageType = isDepthCompare
       ? m_module.defSampledImageType(textureResource.depthTypeId)
       : m_module.defSampledImageType(textureResource.colorTypeId);
@@ -4752,6 +4962,172 @@ namespace dxvk {
     return m_module.opSampledImage(sampledImageType,
       m_module.opLoad(textureResource.imageTypeId, textureResource.varId),
       m_module.opLoad(samplerResource.typeId,      samplerResource.varId));
+  }
+
+
+  uint32_t DxbcCompiler::emitLoadCombinedImage(
+          DxbcShaderResource& textureResource,
+          bool               isDepthCompare) {
+    const uint32_t imageTypeId = isDepthCompare
+      ? textureResource.depthTypeId
+      : textureResource.colorTypeId;
+    const uint32_t sampledImageType = m_module.defSampledImageType(imageTypeId);
+
+    if (!textureResource.varId) {
+      const uint32_t bindingId = textureResource.bindingId;
+      textureResource.varId = m_module.newVar(
+        m_module.defPointerType(sampledImageType, spv::StorageClassUniformConstant),
+        spv::StorageClassUniformConstant);
+      m_module.decorateDescriptorSet(textureResource.varId, 0);
+      m_module.decorateBinding(textureResource.varId, bindingId);
+
+      const uint32_t specConstId = m_module.specConstBool(true);
+      m_module.decorateSpecId(specConstId, bindingId);
+      textureResource.specId = specConstId;
+
+      DxvkResourceSlot resource;
+      resource.slot = bindingId;
+      resource.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      resource.view = textureResource.imageInfo.vtype;
+      resource.access = VK_ACCESS_SHADER_READ_BIT;
+      m_resourceSlots.push_back(resource);
+    }
+
+    return m_module.opLoad(sampledImageType, textureResource.varId);
+  }
+
+
+  DxbcRegisterValue DxbcCompiler::emitLoadSamplerEmulationData(
+          uint32_t samplerId,
+          uint32_t vectorId) {
+    const DxbcVectorType vecType = { DxbcScalarType::Float32, 4 };
+    const std::array<uint32_t, 2> indices = {{
+      m_module.constu32(0),
+      m_module.constu32(2 * samplerId + vectorId),
+    }};
+
+    const uint32_t ptrTypeId = m_module.defPointerType(
+      getVectorTypeId(vecType), spv::StorageClassUniform);
+    const uint32_t ptrId = m_module.opAccessChain(
+      ptrTypeId,
+      m_constantBuffers.at(SamplerEmulationBindingSlotId).varId,
+      indices.size(), indices.data());
+
+    DxbcRegisterValue result;
+    result.type = vecType;
+    result.id = m_module.opLoad(getVectorTypeId(vecType), ptrId);
+    return result;
+  }
+
+
+  DxbcRegisterValue DxbcCompiler::emitCustomBorderColorCorrection(
+          DxbcRegisterValue       value,
+          DxbcRegisterValue       coord,
+    const DxbcRegister&           textureReg,
+    const DxbcShaderResource&     texture,
+          uint32_t                samplerId,
+          DxbcRegisterValue       lod) {
+    const uint32_t dim = getTexLayerDim(texture.imageInfo);
+    const uint32_t floatType = getScalarTypeId(DxbcScalarType::Float32);
+    const uint32_t boolType  = m_module.defBoolType();
+    const uint32_t zero      = m_module.constf32(0.0f);
+    const uint32_t half      = m_module.constf32(0.5f);
+    const uint32_t one       = m_module.constf32(1.0f);
+
+    DxbcRegisterValue mipLevel;
+    mipLevel.type = { DxbcScalarType::Uint32, 1 };
+    mipLevel.id = m_module.constu32(0);
+
+    DxbcRegisterValue size = emitQueryTextureSize(textureReg, mipLevel);
+    DxbcRegisterValue border = emitLoadSamplerEmulationData(samplerId, 0);
+    DxbcRegisterValue metadata = emitLoadSamplerEmulationData(samplerId, 1);
+
+    uint32_t pointInsideWeight = one;
+    uint32_t linearInsideWeight = one;
+
+    for (uint32_t i = 0; i < dim; i++) {
+      const uint32_t coordValue = coord.type.ccount == 1
+        ? coord.id
+        : m_module.opCompositeExtract(floatType, coord.id, 1, &i);
+      const uint32_t sizeUint = size.type.ccount == 1
+        ? size.id
+        : m_module.opCompositeExtract(
+            getScalarTypeId(DxbcScalarType::Uint32), size.id, 1, &i);
+      const uint32_t sizeValue = m_module.opConvertUtoF(floatType, sizeUint);
+      const uint32_t axisIndex = i + 1;
+      const uint32_t axisMask = m_module.opCompositeExtract(
+        floatType, metadata.id, 1, &axisIndex);
+
+      const uint32_t pointPos = m_module.opFloor(
+        floatType, m_module.opFMul(floatType, coordValue, sizeValue));
+      const uint32_t pointGeZero = m_module.opFOrdGreaterThanEqual(
+        boolType, pointPos, zero);
+      const uint32_t pointLtSize = m_module.opFOrdLessThan(
+        boolType, pointPos, sizeValue);
+      const uint32_t pointInside = m_module.opLogicalAnd(
+        boolType, pointGeZero, pointLtSize);
+      const uint32_t pointAxisWeight = m_module.opSelect(
+        floatType, pointInside, one, zero);
+
+      const uint32_t linearPos = m_module.opFSub(floatType,
+        m_module.opFMul(floatType, coordValue, sizeValue), half);
+      const uint32_t linearBase = m_module.opFloor(floatType, linearPos);
+      const uint32_t linearFrac = m_module.opFSub(
+        floatType, linearPos, linearBase);
+      const uint32_t linearNext = m_module.opFAdd(
+        floatType, linearBase, one);
+
+      const uint32_t baseInside = m_module.opLogicalAnd(boolType,
+        m_module.opFOrdGreaterThanEqual(boolType, linearBase, zero),
+        m_module.opFOrdLessThan(boolType, linearBase, sizeValue));
+      const uint32_t nextInside = m_module.opLogicalAnd(boolType,
+        m_module.opFOrdGreaterThanEqual(boolType, linearNext, zero),
+        m_module.opFOrdLessThan(boolType, linearNext, sizeValue));
+      const uint32_t baseWeight = m_module.opSelect(floatType,
+        baseInside, m_module.opFSub(floatType, one, linearFrac), zero);
+      const uint32_t nextWeight = m_module.opSelect(
+        floatType, nextInside, linearFrac, zero);
+      const uint32_t linearAxisWeight = m_module.opFAdd(
+        floatType, baseWeight, nextWeight);
+
+      const uint32_t maskedPointWeight = m_module.opFSub(floatType, one,
+        m_module.opFMul(floatType, axisMask,
+          m_module.opFSub(floatType, one, pointAxisWeight)));
+      const uint32_t maskedLinearWeight = m_module.opFSub(floatType, one,
+        m_module.opFMul(floatType, axisMask,
+          m_module.opFSub(floatType, one, linearAxisWeight)));
+
+      pointInsideWeight = m_module.opFMul(
+        floatType, pointInsideWeight, maskedPointWeight);
+      linearInsideWeight = m_module.opFMul(
+        floatType, linearInsideWeight, maskedLinearWeight);
+    }
+
+    const uint32_t modeIndex = 0;
+    const uint32_t mode = m_module.opCompositeExtract(
+      floatType, metadata.id, 1, &modeIndex);
+    const uint32_t pointMode = m_module.opFOrdEqual(
+      boolType, mode, m_module.constf32(1.0f));
+    const uint32_t linearMode = m_module.opFOrdEqual(
+      boolType, mode, m_module.constf32(2.0f));
+
+    const uint32_t outsidePoint = m_module.opFSub(
+      floatType, one, pointInsideWeight);
+    const uint32_t outsideLinear = m_module.opFSub(
+      floatType, one, linearInsideWeight);
+    uint32_t outsideWeight = m_module.opSelect(floatType, pointMode,
+      outsidePoint,
+      m_module.opSelect(floatType, linearMode, outsideLinear, zero));
+
+    const uint32_t lodIsZero = m_module.opFOrdEqual(boolType, lod.id, zero);
+    outsideWeight = m_module.opSelect(
+      floatType, lodIsZero, outsideWeight, zero);
+
+    value.id = m_module.opFAdd(
+      getVectorTypeId(value.type), value.id,
+      m_module.opVectorTimesScalar(
+        getVectorTypeId(value.type), border.id, outsideWeight));
+    return value;
   }
   
   
@@ -5353,11 +5729,20 @@ namespace dxvk {
     DxbcRegisterValue result;
     result.type.ctype  = DxbcScalarType::Uint32;
     result.type.ccount = 1;
-    
+
     if (info.image.sampled == 1) {
-      result.id = m_module.opImageQueryLevels(
-        getVectorTypeId(result.type),
-        m_module.opLoad(info.typeId, info.varId));
+        uint32_t imageId;
+        if (m_moduleInfo.options.useCombinedImageSampler
+         && resource.type == DxbcOperandType::Resource) {
+          auto& texture = m_textures.at(resource.idx[0].offset);
+          imageId = m_module.opImage(info.typeId,
+            emitLoadCombinedImage(texture, false));
+        } else {
+          imageId = m_module.opLoad(info.typeId, info.varId);
+        }
+        result.id = m_module.opImageQueryLevels(
+          getVectorTypeId(result.type),
+          imageId);
     } else {
       // Report one LOD in case of UAVs
       result.id = m_module.constu32(1);
@@ -5395,9 +5780,18 @@ namespace dxvk {
       result.type.ccount = 1;
 
       if (info.image.ms) {
-        result.id = m_module.opImageQuerySamples(
-          getVectorTypeId(result.type),
-          m_module.opLoad(info.typeId, info.varId));
+          uint32_t imageId;
+          if (m_moduleInfo.options.useCombinedImageSampler
+           && resource.type == DxbcOperandType::Resource) {
+            auto& texture = m_textures.at(resource.idx[0].offset);
+            imageId = m_module.opImage(info.typeId,
+              emitLoadCombinedImage(texture, false));
+          } else {
+            imageId = m_module.opLoad(info.typeId, info.varId);
+          }
+          result.id = m_module.opImageQuerySamples(
+            getVectorTypeId(result.type),
+            imageId);
       } else {
         // OpImageQuerySamples requires MSAA images
         result.id = m_module.constu32(1);
@@ -5419,16 +5813,43 @@ namespace dxvk {
     DxbcRegisterValue result;
     result.type.ctype  = DxbcScalarType::Uint32;
     result.type.ccount = getTexSizeDim(info.image);
-    
-    if (info.image.ms == 0 && info.image.sampled == 1) {
-      result.id = m_module.opImageQuerySizeLod(
-        getVectorTypeId(result.type),
-        m_module.opLoad(info.typeId, info.varId),
-        lod.id);
-    } else {
-      result.id = m_module.opImageQuerySize(
-        getVectorTypeId(result.type),
-        m_module.opLoad(info.typeId, info.varId));
+
+      uint32_t imageId;
+      if (m_moduleInfo.options.useCombinedImageSampler
+       && resource.type == DxbcOperandType::Resource) {
+        auto& texture = m_textures.at(resource.idx[0].offset);
+        imageId = m_module.opImage(info.typeId,
+          emitLoadCombinedImage(texture, false));
+      } else {
+        imageId = m_module.opLoad(info.typeId, info.varId);
+      }
+
+      if (info.image.ms == 0 && info.image.sampled == 1) {
+        result.id = m_module.opImageQuerySizeLod(
+          getVectorTypeId(result.type),
+          imageId,
+          lod.id);
+      } else {
+        result.id = m_module.opImageQuerySize(
+          getVectorTypeId(result.type),
+          imageId);
+    }
+
+    if (resource.type == DxbcOperandType::Resource
+     && m_textures.at(resource.idx[0].offset).emulateCubeArrayDref
+     && result.type.ccount == 3) {
+      DxbcRegisterValue width =
+        emitRegisterExtract(result, DxbcRegMask(true, false, false, false));
+      DxbcRegisterValue height =
+        emitRegisterExtract(result, DxbcRegMask(false, true, false, false));
+      DxbcRegisterValue cubes =
+        emitRegisterExtract(result, DxbcRegMask(false, false, true, false));
+      cubes.id = m_module.opUDiv(
+        getVectorTypeId(cubes.type), cubes.id, m_module.constu32(6));
+      const std::array<uint32_t, 3> components =
+        {{ width.id, height.id, cubes.id }};
+      result.id = m_module.opCompositeConstruct(
+        getVectorTypeId(result.type), components.size(), components.data());
     }
 
     // Report a size of zero for unbound textures
@@ -7040,6 +7461,48 @@ namespace dxvk {
       m_module.opLabel(cond.labelIf);
       m_module.opKill();
       
+      m_module.opLabel(cond.labelEnd);
+    }
+
+    // Maleoon exposes alpha-to-coverage for single-sample pipelines but does
+    // not remove fully transparent fragments. Preserve the narrow D3D
+    // compatibility guarantee here without approximating multisample
+    // coverage for partially transparent texels. Keeping non-zero alpha is
+    // important for this sample's fine leaf and grass edges; a fixed 0.5
+    // alpha-test removes most of those valid texels.
+    if (m_oRegs[0].id != 0
+     && m_oRegs[0].type.ctype == DxbcScalarType::Float32
+     && m_oRegs[0].type.ccount >= 4) {
+      const uint32_t enabled = emitNewSpecConstant(
+        DxvkSpecConstantId::AlphaToCoverageSingleSample,
+        DxbcScalarType::Uint32, 0,
+        "AlphaToCoverageSingleSample");
+      const uint32_t epsilon = emitNewSpecConstant(
+        DxvkSpecConstantId::AlphaToCoverageSingleSampleEpsilon,
+        DxbcScalarType::Float32, 0,
+        "AlphaToCoverageSingleSampleEpsilon");
+      const DxbcRegisterValue color = emitValueLoad(m_oRegs[0]);
+      const uint32_t alphaComponent = 3;
+      const uint32_t alpha = m_module.opCompositeExtract(
+        getScalarTypeId(DxbcScalarType::Float32), color.id,
+        1, &alphaComponent);
+      const uint32_t fallbackEnabled = m_module.opINotEqual(
+        m_module.defBoolType(), enabled, m_module.constu32(0));
+      const uint32_t transparent = m_module.opFOrdLessThanEqual(
+        m_module.defBoolType(), alpha, epsilon);
+      const uint32_t discard = m_module.opLogicalAnd(
+        m_module.defBoolType(), fallbackEnabled, transparent);
+
+      DxbcConditional cond;
+      cond.labelIf = m_module.allocateId();
+      cond.labelEnd = m_module.allocateId();
+
+      m_module.opSelectionMerge(cond.labelEnd, spv::SelectionControlMaskNone);
+      m_module.opBranchConditional(discard, cond.labelIf, cond.labelEnd);
+
+      m_module.opLabel(cond.labelIf);
+      m_module.opKill();
+
       m_module.opLabel(cond.labelEnd);
     }
     

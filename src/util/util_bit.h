@@ -1,22 +1,26 @@
 #pragma once
 
-#ifndef _MSC_VER
-#if defined(__WINE__) && defined(__clang__)
-#pragma push_macro("_WIN32")
-#undef _WIN32
-#endif
-#include <x86intrin.h>
-#if defined(__WINE__) && defined(__clang__)
-#pragma pop_macro("_WIN32")
-#endif
-#else
-#include <intrin.h>
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+  #define DXVK_LEGACY_ARCH_X86 1
+  #ifndef _MSC_VER
+    #if defined(__WINE__) && defined(__clang__)
+      #pragma push_macro("_WIN32")
+      #undef _WIN32
+    #endif
+    #include <x86intrin.h>
+    #if defined(__WINE__) && defined(__clang__)
+      #pragma pop_macro("_WIN32")
+    #endif
+  #else
+    #include <intrin.h>
+  #endif
 #endif
 
 #include "util_likely.h"
 #include "util_math.h"
 
 #include <cstring>
+#include <cstdint>
 #include <iterator>
 #include <type_traits>
 
@@ -51,11 +55,11 @@ namespace dxvk::bit {
   }
   
   inline uint32_t tzcnt(uint32_t n) {
-    #if defined(_MSC_VER) && !defined(__clang__)
+    #if defined(DXVK_LEGACY_ARCH_X86) && defined(_MSC_VER) && !defined(__clang__)
     return _tzcnt_u32(n);
-    #elif defined(__BMI__)
+    #elif defined(DXVK_LEGACY_ARCH_X86) && defined(__BMI__)
     return __tzcnt_u32(n);
-    #elif defined(__GNUC__) || defined(__clang__)
+    #elif defined(DXVK_LEGACY_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))
     uint32_t res;
     uint32_t tmp;
     asm (
@@ -97,7 +101,7 @@ namespace dxvk::bit {
   }
 
   inline uint32_t lzcnt(uint32_t n) {
-    #if (defined(_MSC_VER) && !defined(__clang__)) || defined(__LZCNT__)
+    #if defined(DXVK_LEGACY_ARCH_X86) && ((defined(_MSC_VER) && !defined(__clang__)) || defined(__LZCNT__))
     return _lzcnt_u32(n);
     #elif defined(__GNUC__) || defined(__clang__)
     return n != 0 ? __builtin_clz(n) : 32;
@@ -144,7 +148,7 @@ namespace dxvk::bit {
   template<typename T>
   bool bcmpeq(const T* a, const T* b) {
     static_assert(alignof(T) >= 16);
-    #if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
+    #if defined(DXVK_LEGACY_ARCH_X86)
     auto ai = reinterpret_cast<const __m128i*>(a);
     auto bi = reinterpret_cast<const __m128i*>(b);
 

@@ -19,9 +19,11 @@ namespace dxvk {
 
     m_options = DxvkOptions(m_config);
 
+    #if !defined(DXVK_NATIVE_OHOS)
     m_extProviders.push_back(&DxvkPlatformExts::s_instance);
     m_extProviders.push_back(&VrInstance::s_instance);
     m_extProviders.push_back(&DxvkXrProvider::s_instance);
+    #endif
 
     Logger::info("Built-in extension providers:");
     for (const auto& provider : m_extProviders)
@@ -90,6 +92,9 @@ namespace dxvk {
     std::vector<DxvkExt*> insExtensionList = {{
       &insExtensions.khrGetSurfaceCapabilities2,
       &insExtensions.khrSurface,
+      #if defined(DXVK_NATIVE_OHOS)
+      &insExtensions.ohosSurface,
+      #endif
     }};
 
     // Hide VK_EXT_debug_utils behind an environment variable. This extension

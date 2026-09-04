@@ -992,7 +992,9 @@ namespace dxvk {
 
       for (uint32_t i = 0; i < numWorkers; i++) {
         m_workerThreads.emplace_back([this] () { workerFunc(); });
+        #if !defined(DXVK_NATIVE_OHOS)
         m_workerThreads[i].set_priority(ThreadPriority::Lowest);
+        #endif
       }
     }
   }

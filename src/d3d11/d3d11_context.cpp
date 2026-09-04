@@ -1,5 +1,7 @@
+#include <cstdlib>
 #include <cstring>
 
+#include "d3d11_bc.h"
 #include "d3d11_context.h"
 #include "d3d11_device.h"
 #include "d3d11_query.h"
@@ -7,6 +9,7 @@
 #include "d3d11_video.h"
 
 #include "../dxbc/dxbc_util.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -23,6 +26,34 @@ namespace dxvk {
     m_csFlags   (CsFlags),
     m_csChunk   (AllocCsChunk()),
     m_cmdData   (nullptr) {
+
+    const char* disableSamplerEmulation =
+      std::getenv("WINEHUA_DXVK_DISABLE_CUSTOM_BORDER_EMULATION");
+    m_samplerEmulationEnabled = !Device->features()
+      .extCustomBorderColor.customBorderColorWithoutFormat
+      && !(disableSamplerEmulation && disableSamplerEmulation[0] == '1');
+    winehuaFlowTrace(str::format(
+      "d3d11-context sampler-emulation=", m_samplerEmulationEnabled ? 1 : 0));
+
+    if (m_samplerEmulationEnabled) {
+      for (uint32_t i = 0; i < m_samplerEmulationBuffers.size(); i++) {
+        const auto programType = DxbcProgramType(i);
+        DxvkBufferCreateInfo info;
+        info.size   = sizeof(SamplerEmulationStageData);
+        info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        info.stages = util::pipelineStages(GetShaderStage(programType));
+        info.access = VK_ACCESS_UNIFORM_READ_BIT;
+
+        m_samplerEmulationBuffers[i] = Device->createBuffer(info,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        auto slice = m_samplerEmulationBuffers[i]->getSliceHandle();
+        std::memset(slice.mapPtr, 0, slice.length);
+        m_samplerEmulationBuffers[i]->flushMappedSlice(slice);
+      }
+    }
 
   }
   
@@ -148,6 +179,7 @@ namespace dxvk {
   
   void STDMETHODCALLTYPE D3D11DeviceContext::ClearState() {
     D3D10DeviceLock lock = LockContext();
+    winehuaFlowTrace("d3d11-clear-state begin");
 
     // Default shaders
     m_state.vs.shader = nullptr;
@@ -175,6 +207,20 @@ namespace dxvk {
       m_state.gs.samplers[i] = nullptr;
       m_state.ps.samplers[i] = nullptr;
       m_state.cs.samplers[i] = nullptr;
+    }
+
+    if (m_samplerEmulationEnabled) {
+      winehuaFlowTrace("d3d11-clear-state sampler-reset begin");
+      for (auto& stage : m_samplerEmulationData)
+        stage = { };
+
+      UpdateSamplerEmulationBuffer<DxbcProgramType::VertexShader>();
+      UpdateSamplerEmulationBuffer<DxbcProgramType::HullShader>();
+      UpdateSamplerEmulationBuffer<DxbcProgramType::DomainShader>();
+      UpdateSamplerEmulationBuffer<DxbcProgramType::GeometryShader>();
+      UpdateSamplerEmulationBuffer<DxbcProgramType::PixelShader>();
+      UpdateSamplerEmulationBuffer<DxbcProgramType::ComputeShader>();
+      winehuaFlowTrace("d3d11-clear-state sampler-reset end");
     }
     
     // Default shader resources
@@ -258,6 +304,7 @@ namespace dxvk {
     
     // Make sure to apply all state
     ResetState();
+    winehuaFlowTrace("d3d11-clear-state end");
   }
   
   
@@ -1188,6 +1235,203 @@ namespace dxvk {
         BaseVertexLocation, 0);
     });
   }
+
+
+  bool D3D11DeviceContext::TryEmitInstanceDivisorDraw(
+          bool            Indexed,
+          UINT            ElementCount,
+          UINT            InstanceCount,
+          UINT            StartElementLocation,
+          INT             BaseVertexLocation,
+          UINT            StartInstanceLocation) {
+    if (InstanceCount == 0
+     || GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE
+     || m_state.ia.inputLayout == nullptr
+     || m_device->features().extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor)
+      return false;
+
+    const auto& layoutBindings = m_state.ia.inputLayout->GetBindings();
+    bool needsEmulation = false;
+
+    for (const auto& binding : layoutBindings) {
+      needsEmulation |= binding.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE
+                     && binding.fetchRate > 1;
+    }
+
+    if (!needsEmulation)
+      return false;
+
+    struct EmulatedBinding {
+      uint32_t        slot;
+      uint32_t        stride;
+      uint32_t        divisor;
+      DxvkBufferSlice source;
+      Rc<DxvkBuffer>  expanded;
+    };
+
+    std::vector<EmulatedBinding> emulatedBindings;
+    const uint64_t endInstance = uint64_t(StartInstanceLocation) + InstanceCount;
+    constexpr VkDeviceSize MaxExpandedBytes = 256ull << 20;
+
+    for (const auto& layoutBinding : layoutBindings) {
+      if (layoutBinding.inputRate != VK_VERTEX_INPUT_RATE_INSTANCE
+       || layoutBinding.fetchRate <= 1)
+        continue;
+
+      const uint32_t slot = layoutBinding.binding;
+
+      if (slot >= m_state.ia.vertexBuffers.size())
+        return false;
+
+      const auto& vertexBinding = m_state.ia.vertexBuffers[slot];
+      D3D11Buffer* sourceBuffer = vertexBinding.buffer.ptr();
+      const uint32_t stride = vertexBinding.stride;
+      const uint32_t divisor = layoutBinding.fetchRate;
+
+      if (sourceBuffer == nullptr
+       || stride == 0
+       || sourceBuffer->GetMapMode() != D3D11_COMMON_BUFFER_MAP_MODE_DIRECT) {
+        if (!m_instanceDivisorFailureLogged) {
+          Logger::warn("D3D11: Cannot emulate an instance divisor for a non-mappable vertex buffer");
+          m_instanceDivisorFailureLogged = true;
+        }
+        return false;
+      }
+
+      const uint64_t sourceRecords = (endInstance + divisor - 1) / divisor;
+      const uint64_t sourceEnd = uint64_t(vertexBinding.offset) + sourceRecords * stride;
+      const uint64_t expandedBytes = endInstance * stride;
+
+      if (sourceEnd > sourceBuffer->Desc()->ByteWidth
+       || expandedBytes == 0
+       || expandedBytes > MaxExpandedBytes) {
+        if (!m_instanceDivisorFailureLogged) {
+          Logger::warn(str::format(
+            "D3D11: Cannot emulate instance divisor ", divisor,
+            " for binding ", slot,
+            " (source bytes ", sourceEnd,
+            ", expanded bytes ", expandedBytes, ")"));
+          m_instanceDivisorFailureLogged = true;
+        }
+        return false;
+      }
+
+      const auto sourceSlice = sourceBuffer->GetMappedSlice();
+      const auto* sourceData = reinterpret_cast<const char*>(sourceSlice.mapPtr)
+                             + vertexBinding.offset;
+      const auto sourceHash = Sha1Hash::compute(
+        sourceData, size_t(sourceRecords * stride));
+      auto& cache = m_instanceDivisorCache[slot];
+
+      const bool cacheHit = cache.valid
+                         && cache.sourceBuffer.ptr() == sourceBuffer
+                         && cache.sourceSlice.eq(sourceSlice)
+                         && cache.sourceOffset == vertexBinding.offset
+                         && cache.sourceStride == stride
+                         && cache.divisor == divisor
+                         && cache.startInstance == StartInstanceLocation
+                         && cache.instanceCount == InstanceCount
+                         && cache.sourceHash == sourceHash;
+
+      Rc<DxvkBuffer> expandedBuffer;
+
+      if (cacheHit) {
+        expandedBuffer = cache.expandedBuffer;
+      } else {
+        DxvkBufferCreateInfo bufferInfo;
+        bufferInfo.size   = expandedBytes;
+        bufferInfo.usage  = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        bufferInfo.stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        bufferInfo.access = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+
+        expandedBuffer = m_device->createBuffer(
+          bufferInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        auto expandedSlice = expandedBuffer->getSliceHandle();
+        auto* expandedData = reinterpret_cast<char*>(expandedSlice.mapPtr);
+
+        for (uint64_t instance = StartInstanceLocation; instance < endInstance; instance++) {
+          const uint64_t sourceInstance = instance / divisor;
+          std::memcpy(
+            expandedData + instance * stride,
+            sourceData + sourceInstance * stride,
+            stride);
+        }
+
+        if (expandedBuffer->flushMappedSlice(expandedSlice) != VK_SUCCESS) {
+          if (!m_instanceDivisorFailureLogged) {
+            Logger::warn("D3D11: Failed to publish an emulated instance-divisor buffer");
+            m_instanceDivisorFailureLogged = true;
+          }
+          return false;
+        }
+
+        cache.sourceBuffer  = sourceBuffer;
+        cache.sourceSlice   = sourceSlice;
+        cache.sourceOffset  = vertexBinding.offset;
+        cache.sourceStride  = stride;
+        cache.divisor       = divisor;
+        cache.startInstance = StartInstanceLocation;
+        cache.instanceCount = InstanceCount;
+        cache.sourceHash    = sourceHash;
+        cache.expandedBuffer = expandedBuffer;
+        cache.valid         = true;
+      }
+
+      emulatedBindings.push_back({
+        slot,
+        stride,
+        divisor,
+        sourceBuffer->GetBufferSlice(vertexBinding.offset),
+        std::move(expandedBuffer),
+      });
+    }
+
+    if (emulatedBindings.empty())
+      return false;
+
+    if (!m_instanceDivisorEmulationLogged) {
+      Logger::info(str::format(
+        "D3D11: Emulating unsupported vertex attribute divisor for ",
+        emulatedBindings.size(), " binding(s)"));
+      m_instanceDivisorEmulationLogged = true;
+    }
+
+    EmitCs([
+      cBindings             = std::move(emulatedBindings),
+      cIndexed              = Indexed,
+      cElementCount         = ElementCount,
+      cInstanceCount        = InstanceCount,
+      cStartElementLocation = StartElementLocation,
+      cBaseVertexLocation   = BaseVertexLocation,
+      cStartInstance        = StartInstanceLocation
+    ] (DxvkContext* ctx) {
+      for (const auto& binding : cBindings)
+        ctx->bindVertexBuffer(binding.slot, DxvkBufferSlice(binding.expanded), binding.stride);
+
+      if (cIndexed) {
+        ctx->drawIndexed(
+          cElementCount,
+          cInstanceCount,
+          cStartElementLocation,
+          cBaseVertexLocation,
+          cStartInstance);
+      } else {
+        ctx->draw(
+          cElementCount,
+          cInstanceCount,
+          cStartElementLocation,
+          cStartInstance);
+      }
+
+      for (const auto& binding : cBindings)
+        ctx->bindVertexBuffer(binding.slot, binding.source, binding.stride);
+    });
+
+    return true;
+  }
   
   
   void STDMETHODCALLTYPE D3D11DeviceContext::DrawInstanced(
@@ -1196,6 +1440,15 @@ namespace dxvk {
           UINT            StartVertexLocation,
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
+
+    if (TryEmitInstanceDivisorDraw(
+          false,
+          VertexCountPerInstance,
+          InstanceCount,
+          StartVertexLocation,
+          0,
+          StartInstanceLocation))
+      return;
     
     EmitCs([=] (DxvkContext* ctx) {
       ctx->draw(
@@ -1214,6 +1467,15 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
+
+    if (TryEmitInstanceDivisorDraw(
+          true,
+          IndexCountPerInstance,
+          InstanceCount,
+          StartIndexLocation,
+          BaseVertexLocation,
+          StartInstanceLocation))
+      return;
     
     EmitCs([=] (DxvkContext* ctx) {
       ctx->drawIndexed(
@@ -3118,6 +3380,38 @@ namespace dxvk {
 
   
   template<DxbcProgramType ShaderStage>
+  void D3D11DeviceContext::UpdateSamplerEmulationBuffer() {
+    if (!m_samplerEmulationEnabled)
+      return;
+
+    constexpr uint32_t stageId = uint32_t(ShaderStage);
+    winehuaFlowTrace(str::format(
+      "d3d11-sampler-buffer begin stage=", stageId));
+    const Rc<DxvkBuffer> buffer = m_samplerEmulationBuffers[stageId];
+    const DxvkBufferSliceHandle slice = buffer->allocSlice();
+    winehuaFlowTrace(str::format(
+      "d3d11-sampler-buffer allocated stage=", stageId));
+
+    std::memcpy(slice.mapPtr,
+      m_samplerEmulationData[stageId].data(),
+      sizeof(SamplerEmulationStageData));
+
+    EmitCs([
+      cBuffer = buffer,
+      cSlice  = slice
+    ] (DxvkContext* ctx) {
+      ctx->flushMappedBuffer(cBuffer, cSlice);
+      ctx->invalidateBuffer(cBuffer, cSlice);
+      ctx->bindResourceBuffer(
+        computeConstantBufferBinding(ShaderStage, 15),
+        DxvkBufferSlice(cBuffer, 0, sizeof(SamplerEmulationStageData)));
+    });
+    winehuaFlowTrace(str::format(
+      "d3d11-sampler-buffer end stage=", stageId));
+  }
+
+
+  template<DxbcProgramType ShaderStage>
   void D3D11DeviceContext::BindShader(
     const D3D11CommonShader*    pShaderModule) {
     // Bind the shader and the ICB at once
@@ -3128,6 +3422,9 @@ namespace dxvk {
         : DxvkBufferSlice(),
       cShader = pShaderModule != nullptr
         ? pShaderModule->GetShader()
+        : nullptr,
+      cSamplerInfo = m_samplerEmulationEnabled
+        ? m_samplerEmulationBuffers[uint32_t(ShaderStage)]
         : nullptr
     ] (DxvkContext* ctx) {
       VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
@@ -3137,6 +3434,12 @@ namespace dxvk {
 
       ctx->bindShader        (stage,  cShader);
       ctx->bindResourceBuffer(slotId, cSlice);
+
+      if (cSamplerInfo != nullptr) {
+        ctx->bindResourceBuffer(
+          computeConstantBufferBinding(ShaderStage, 15),
+          DxvkBufferSlice(cSamplerInfo, 0, sizeof(SamplerEmulationStageData)));
+      }
     });
   }
 
@@ -3258,9 +3561,13 @@ namespace dxvk {
           D3D11Buffer*                      pBuffer,
           UINT                              Offset,
           UINT                              Length) {
+    auto bufferSlice = Length
+      ? pBuffer->GetMappedBufferSlice(16 * Offset, 16 * Length)
+      : DxvkBufferSlice();
+
     EmitCs([
       cSlotId      = Slot,
-      cBufferSlice = Length ? pBuffer->GetBufferSlice(16 * Offset, 16 * Length) : DxvkBufferSlice()
+      cBufferSlice = std::move(bufferSlice)
     ] (DxvkContext* ctx) {
       ctx->bindResourceBuffer(cSlotId, cBufferSlice);
     });
@@ -3370,6 +3677,19 @@ namespace dxvk {
     const VkImageSubresourceLayers*         pSrcLayers,
           VkOffset3D                        SrcOffset,
           VkExtent3D                        SrcExtent) {
+    // A native RGBA8 SNORM image and an emulated RGBA16F image have different
+    // texel sizes. A raw Vulkan copy would be invalid and could corrupt memory.
+    // Emulated-to-emulated copies remain ordinary GPU image copies. Mixed
+    // copies require an explicit GPU pack/unpack path and are rejected until
+    // that path exists.
+    if (pDstTexture->IsRgba8SnormRtEmulated()
+     != pSrcTexture->IsRgba8SnormRtEmulated()) {
+      static std::atomic<uint32_t> warnings { 0 };
+      if (warnings.fetch_add(1, std::memory_order_relaxed) < 16)
+        Logger::err("WineHua: CopyImage between native and emulated RGBA8 SNORM resources is unsupported");
+      return;
+    }
+
     // Image formats must be size-compatible
     auto dstFormatInfo = imageFormatInfo(pDstTexture->GetPackedFormat());
     auto srcFormatInfo = imageFormatInfo(pSrcTexture->GetPackedFormat());
@@ -3670,6 +3990,9 @@ namespace dxvk {
         cStagingSlice = std::move(stagingSlice),
         cBufferSlice  = std::move(bufferSlice)
       ] (DxvkContext* ctx) {
+        if (winehuaFlushDynamicMapped())
+          ctx->flushMappedBuffer(
+            cStagingSlice.buffer(), cStagingSlice.getSliceHandle());
         ctx->copyBuffer(
           cBufferSlice.buffer(),
           cBufferSlice.offset(),
@@ -3725,12 +4048,50 @@ namespace dxvk {
       return;
     }
 
+    const bool bcEmulated = formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
+                         && !pDstTexture->GetImage()->formatInfo()->flags.test(DxvkFormatFlag::BlockCompressed);
+    const bool snormRtEmulated = pDstTexture->IsRgba8SnormRtEmulated();
+    const bool traceAlpha = subresource.mipLevel == 0
+      && formatInfo->elementSize == 4
+      && !formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
+      && !formatInfo->flags.test(DxvkFormatFlag::MultiPlane);
+    if (traceAlpha)
+      winehuaTraceRgbaAlpha("update-src", pSrcData,
+        extent.width, extent.height, SrcRowPitch,
+        uint32_t(packedFormat), DstSubresource, subresource.arrayLayer);
+    if (snormRtEmulated || bcEmulated) {
+      D3D11CpuImage converted;
+      const bool convertedOk = snormRtEmulated
+        ? ConvertD3D11Rgba8SnormToRgba16Float(
+            extent, pSrcData, SrcRowPitch, SrcDepthPitch, converted)
+        : DecodeD3D11BcImage(
+            packedFormat, extent, pSrcData, SrcRowPitch, SrcDepthPitch, converted);
+
+      if (!convertedOk) {
+        Logger::err(snormRtEmulated
+          ? "WineHua: Failed to convert RGBA8 SNORM UpdateSubresource data"
+          : "WineHua: Failed to decompress BC UpdateSubresource data");
+        return;
+      }
+
+      auto stagingSlice = AllocStagingBuffer(converted.data.size());
+      std::memcpy(stagingSlice.mapPtr(0), converted.data.data(), converted.data.size());
+      UpdateImage(pDstTexture, &subresource, offset, extent, std::move(stagingSlice));
+      return;
+    }
+
     auto stagingSlice = AllocStagingBuffer(util::computeImageDataSize(packedFormat, extent));
 
     util::packImageData(stagingSlice.mapPtr(0),
       pSrcData, SrcRowPitch, SrcDepthPitch, 0, 0,
       pDstTexture->GetVkImageType(), extent, 1,
       formatInfo, formatInfo->aspectMask);
+
+    if (traceAlpha)
+      winehuaTraceRgbaAlpha("update-packed", stagingSlice.mapPtr(0),
+        extent.width, extent.height,
+        uint64_t(extent.width) * formatInfo->elementSize,
+        uint32_t(packedFormat), DstSubresource, subresource.arrayLayer);
 
     UpdateImage(pDstTexture, &subresource,
       offset, extent, std::move(stagingSlice));
@@ -3744,6 +4105,15 @@ namespace dxvk {
           VkExtent3D                        DstExtent,
           DxvkBufferSlice                   StagingBuffer) {
     bool dstIsImage = pDstTexture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING;
+
+    if (winehuaFlushDynamicMapped()) {
+      EmitCs([
+        cStagingSlice = StagingBuffer
+      ] (DxvkContext* ctx) {
+        ctx->flushMappedBuffer(
+          cStagingSlice.buffer(), cStagingSlice.getSliceHandle());
+      });
+    }
 
     uint32_t dstSubresource = D3D11CalcSubresource(pDstSubresource->mipLevel,
       pDstSubresource->arrayLayer, pDstTexture->Desc()->MipLevels);
@@ -3944,6 +4314,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     uint32_t slotId = computeSamplerBinding(ShaderStage, StartSlot);
+    bool samplerInfoChanged = false;
     
     for (uint32_t i = 0; i < NumSamplers; i++) {
       auto sampler = static_cast<D3D11SamplerState*>(ppSamplers[i]);
@@ -3951,8 +4322,19 @@ namespace dxvk {
       if (Bindings[StartSlot + i] != sampler) {
         Bindings[StartSlot + i] = sampler;
         BindSampler(slotId + i, sampler);
+
+        if (m_samplerEmulationEnabled) {
+          m_samplerEmulationData[uint32_t(ShaderStage)][StartSlot + i]
+            = sampler != nullptr
+            ? sampler->GetEmulationData()
+            : D3D11SamplerEmulationData();
+          samplerInfoChanged = true;
+        }
       }
     }
+
+    if (samplerInfoChanged)
+      UpdateSamplerEmulationBuffer<ShaderStage>();
   }
   
   
@@ -4105,7 +4487,7 @@ namespace dxvk {
         // Unbind constant buffers, including the shader's ICB
         auto cbSlotId = computeConstantBufferBinding(programType, 0);
 
-        for (uint32_t j = 0; j <= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; j++)
+        for (uint32_t j = 0; j < DxbcConstBufBindingCount; j++)
           ctx->bindResourceBuffer(cbSlotId + j, DxvkBufferSlice());
 
         // Unbind shader resource views
@@ -4219,6 +4601,8 @@ namespace dxvk {
     
     for (uint32_t i = 0; i < Bindings.size(); i++)
       BindSampler(slotId + i, Bindings[i]);
+
+    UpdateSamplerEmulationBuffer<Stage>();
   }
   
   

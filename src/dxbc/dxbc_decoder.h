@@ -48,6 +48,7 @@ namespace dxvk {
   struct DxbcSampler {
     uint32_t varId  = 0;
     uint32_t typeId = 0;
+    uint32_t bindingId = 0;
   };
   
   
@@ -74,11 +75,13 @@ namespace dxvk {
     DxbcImageInfo     imageInfo;
     uint32_t          varId         = 0;
     uint32_t          specId        = 0;
+    uint32_t          bindingId     = 0;
     DxbcScalarType    sampledType   = DxbcScalarType::Float32;
     uint32_t          sampledTypeId = 0;
     uint32_t          imageTypeId   = 0;
     uint32_t          colorTypeId   = 0;
     uint32_t          depthTypeId   = 0;
+    bool              emulateCubeArrayDref = false;
     uint32_t          structStride  = 0;
     uint32_t          structAlign   = 0;
   };

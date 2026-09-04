@@ -1,8 +1,33 @@
 #include "util_shared_res.h"
 
+#if !defined(DXVK_NATIVE_OHOS)
 #include "winioctl.h"
+#endif
+
+#if defined(DXVK_NATIVE_OHOS)
+#include "log/log.h"
+#endif
 
 namespace dxvk {
+
+#if defined(DXVK_NATIVE_OHOS)
+
+  HANDLE openKmtHandle(HANDLE) {
+    Logger::warn("openKmtHandle: cross-process shared resources are unavailable in native OpenHarmony mode.");
+    return INVALID_HANDLE_VALUE;
+  }
+
+  bool setSharedMetadata(HANDLE, void*, uint32_t) {
+    Logger::warn("setSharedMetadata: cross-process shared resources are unavailable in native OpenHarmony mode.");
+    return false;
+  }
+
+  bool getSharedMetadata(HANDLE, void*, uint32_t, uint32_t*) {
+    Logger::warn("getSharedMetadata: cross-process shared resources are unavailable in native OpenHarmony mode.");
+    return false;
+  }
+
+#else
 
   #define IOCTL_SHARED_GPU_RESOURCE_OPEN             CTL_CODE(FILE_DEVICE_VIDEO, 1, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
@@ -42,5 +67,7 @@ namespace dxvk {
       *metadataSize = retSize;
     return ret;
   }
+
+#endif
 
 }

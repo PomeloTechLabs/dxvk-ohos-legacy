@@ -21,6 +21,17 @@ namespace dxvk {
     bool accessAtomicOp  = false;
     VkAccessFlags accessFlags = 0;
   };
+
+  /**
+   * \brief Info about shader resource views
+   *
+   * Tracks resource operations that require a declaration-time image type
+   * decision. Maleoon cannot execute native CubeArray Dref instructions, so
+   * affected resources must use their equivalent 2D-array view consistently.
+   */
+  struct DxbcSrvInfo {
+    bool accessCubeArrayDref = false;
+  };
   
   /**
    * \brief Counts cull and clip distances
@@ -35,6 +46,7 @@ namespace dxvk {
    */
   struct DxbcAnalysisInfo {
     std::array<DxbcUavInfo, 64> uavInfos;
+    std::array<DxbcSrvInfo, 128> srvInfos;
     std::array<DxbcRegMask, 4096> xRegMasks;
     
     DxbcClipCullInfo clipCullIn;

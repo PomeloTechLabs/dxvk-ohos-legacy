@@ -100,10 +100,12 @@ namespace dxvk {
     DxvkGraphicsPipelineInstance(
       const DxvkGraphicsPipelineStateInfo&  state,
       const DxvkRenderPass*                 rp,
-            VkPipeline                      pipe)
+            VkPipeline                      pipe,
+            bool                            secondaryOutput)
     : m_stateVector (state),
       m_renderPass  (rp),
-      m_pipeline    (pipe) { }
+      m_pipeline    (pipe),
+      m_secondaryOutput(secondaryOutput) { }
 
     /**
      * \brief Checks for matching pipeline state
@@ -114,9 +116,11 @@ namespace dxvk {
      */
     bool isCompatible(
       const DxvkGraphicsPipelineStateInfo&  state,
-      const DxvkRenderPass*                 rp) {
+      const DxvkRenderPass*                 rp,
+            bool                            secondaryOutput) {
       return m_renderPass  == rp
-          && m_stateVector == state;
+          && m_stateVector == state
+          && m_secondaryOutput == secondaryOutput;
     }
 
     /**
@@ -132,6 +136,7 @@ namespace dxvk {
     DxvkGraphicsPipelineStateInfo m_stateVector;
     const DxvkRenderPass*         m_renderPass;
     VkPipeline                    m_pipeline;
+    bool                          m_secondaryOutput = false;
 
   };
 
@@ -203,7 +208,8 @@ namespace dxvk {
      */
     VkPipeline getPipelineHandle(
       const DxvkGraphicsPipelineStateInfo&    state,
-      const DxvkRenderPass*                   renderPass);
+      const DxvkRenderPass*                   renderPass,
+            bool                              secondaryOutput = false);
     
     /**
      * \brief Compiles a pipeline
@@ -240,22 +246,26 @@ namespace dxvk {
     
     DxvkGraphicsPipelineInstance* createInstance(
       const DxvkGraphicsPipelineStateInfo& state,
-      const DxvkRenderPass*                renderPass);
+      const DxvkRenderPass*                renderPass,
+            bool                           secondaryOutput = false);
     
     DxvkGraphicsPipelineInstance* findInstance(
       const DxvkGraphicsPipelineStateInfo& state,
-      const DxvkRenderPass*                renderPass);
+      const DxvkRenderPass*                renderPass,
+            bool                           secondaryOutput = false);
     
     VkPipeline createPipeline(
       const DxvkGraphicsPipelineStateInfo& state,
-      const DxvkRenderPass*                renderPass) const;
+      const DxvkRenderPass*                renderPass,
+            bool                           secondaryOutput = false) const;
     
     void destroyPipeline(
             VkPipeline                     pipeline) const;
     
     DxvkShaderModule createShaderModule(
       const Rc<DxvkShader>&                shader,
-      const DxvkGraphicsPipelineStateInfo& state) const;
+      const DxvkGraphicsPipelineStateInfo& state,
+            bool                          secondaryOutput = false) const;
     
     Rc<DxvkShader> getPrevStageShader(
             VkShaderStageFlagBits          stage) const;

@@ -2,6 +2,10 @@
 #include "dxgi_output.h"
 #include "dxgi_swapchain.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+#include "dxgi_ohos_swapchain.h"
+#endif
+
 namespace dxvk {
   
   DxgiSwapChain::DxgiSwapChain(
@@ -17,6 +21,7 @@ namespace dxvk {
     m_presentCount(0u),
     m_presenter (pPresenter),
     m_monitor   (nullptr) {
+    #if !defined(DXVK_NATIVE_OHOS)
     if (FAILED(m_presenter->GetAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&m_adapter))))
       throw DxvkError("DXGI: Failed to get adapter for present device");
     
@@ -26,10 +31,12 @@ namespace dxvk {
     // Apply initial window mode and fullscreen state
     if (!m_descFs.Windowed && FAILED(EnterFullscreenMode(nullptr)))
       throw DxvkError("DXGI: Failed to set initial fullscreen state");
+    #endif
   }
   
   
   DxgiSwapChain::~DxgiSwapChain() {
+    #if !defined(DXVK_NATIVE_OHOS)
     RestoreDisplayMode(m_monitor);
 
     // Decouple swap chain from monitor if necessary
@@ -41,6 +48,7 @@ namespace dxvk {
       
       ReleaseMonitorData();
     }
+    #endif
   }
   
   
@@ -90,6 +98,12 @@ namespace dxvk {
   
   HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetContainingOutput(IDXGIOutput** ppOutput) {
     InitReturnPtr(ppOutput);
+    if (!ppOutput)
+      return E_INVALIDARG;
+    #if defined(DXVK_NATIVE_OHOS)
+    // XComponent has no Win32 monitor/output ownership.
+    return DXGI_ERROR_NOT_FOUND;
+    #else
     
     if (!IsWindow(m_window))
       return DXGI_ERROR_INVALID_CALL;
@@ -108,6 +122,7 @@ namespace dxvk {
       MONITOR_DEFAULTTOPRIMARY);
     
     return GetOutputFromMonitor(monitor, ppOutput);
+    #endif
   }
   
   
@@ -170,6 +185,10 @@ namespace dxvk {
     if (!pStats)
       return E_INVALIDARG;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    *pStats = { };
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    #else
     static bool s_errorShown = false;
 
     if (!std::exchange(s_errorShown, true))
@@ -182,6 +201,7 @@ namespace dxvk {
     QueryPerformanceCounter(&pStats->SyncQPCTime);
     pStats->SyncGPUTime.QuadPart = 0;
     return S_OK;
+    #endif
   }
   
   
@@ -256,8 +276,15 @@ namespace dxvk {
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
 
+    #if defined(DXVK_NATIVE_OHOS)
+    DXVKOhosWindowInfo window = { };
+    const auto windowStatus = ohos::windowInfo(m_window, window);
+    if (FAILED(windowStatus)) return windowStatus;
+    if (!window.width || !window.height) return DXGI_STATUS_OCCLUDED;
+    #else
     if (!IsWindow(m_window))
       return S_OK;
+    #endif
     
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
@@ -266,7 +293,7 @@ namespace dxvk {
     std::lock_guard<dxvk::mutex> lockBuf(m_lockBuffer);
 
     try {
-      HRESULT hr = m_presenter->Present(SyncInterval, PresentFlags, nullptr);
+      HRESULT hr = m_presenter->Present(SyncInterval, PresentFlags, pPresentParameters);
       if (hr == S_OK && !(PresentFlags & DXGI_PRESENT_TEST))
         m_presentCount++;
       return hr;
@@ -283,6 +310,27 @@ namespace dxvk {
           UINT        Height,
           DXGI_FORMAT NewFormat,
           UINT        SwapChainFlags) {
+    #if defined(DXVK_NATIVE_OHOS)
+    std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
+    DXGI_SWAP_CHAIN_DESC1 desc = m_desc;
+    desc.Width = Width;
+    desc.Height = Height;
+    desc.Flags = SwapChainFlags;
+    if (BufferCount) desc.BufferCount = BufferCount;
+    if (NewFormat != DXGI_FORMAT_UNKNOWN) desc.Format = NewFormat;
+    auto status = ohos::normalizeSwapchainDesc(m_window, desc);
+    if (FAILED(status)) return status;
+    try {
+      status = m_presenter->ChangeProperties(&desc);
+      if (SUCCEEDED(status)) m_desc = desc;
+      return status;
+    } catch (const std::bad_alloc&) {
+      return E_OUTOFMEMORY;
+    } catch (const DxvkError& error) {
+      Logger::err(error.message());
+      return DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+    }
+    #else
     if (!IsWindow(m_window))
       return DXGI_ERROR_INVALID_CALL;
 
@@ -306,6 +354,7 @@ namespace dxvk {
       m_desc.Format = NewFormat;
     
     return m_presenter->ChangeProperties(&m_desc);
+    #endif
   }
   
   
@@ -328,6 +377,10 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE DxgiSwapChain::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) {
+    #if defined(DXVK_NATIVE_OHOS)
+    // Native window size is changed by the ArkUI host, then ResizeBuffers.
+    return pNewTargetParameters ? DXGI_ERROR_UNSUPPORTED : DXGI_ERROR_INVALID_CALL;
+    #else
     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
 
     if (pNewTargetParameters == nullptr)
@@ -382,6 +435,7 @@ namespace dxvk {
     }
     
     return S_OK;
+    #endif
   }
   
   
@@ -393,12 +447,16 @@ namespace dxvk {
     if (!Fullscreen && pTarget)
       return DXGI_ERROR_INVALID_CALL;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    return Fullscreen ? DXGI_ERROR_UNSUPPORTED : S_OK;
+    #else
     if (m_descFs.Windowed && Fullscreen)
       return this->EnterFullscreenMode(pTarget);
     else if (!m_descFs.Windowed && !Fullscreen)
       return this->LeaveFullscreenMode();
     
     return S_OK;
+    #endif
   }
   
   
@@ -552,6 +610,7 @@ namespace dxvk {
   }
 
 
+  #if !defined(DXVK_NATIVE_OHOS)
   HRESULT DxgiSwapChain::EnterFullscreenMode(IDXGIOutput* pTarget) {
     Com<IDXGIOutput> output = pTarget;
 
@@ -805,5 +864,6 @@ namespace dxvk {
       m_presenter->NotifyModeChange(Windowed, nullptr);
     }
   }
+  #endif
   
 }

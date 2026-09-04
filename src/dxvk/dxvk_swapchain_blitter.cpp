@@ -1,4 +1,6 @@
 #include "dxvk_swapchain_blitter.h"
+#include "dxvk_format.h"
+#include "dxvk_winehua_trace.h"
 
 #include <dxvk_present_frag.h>
 #include <dxvk_present_frag_blit.h>
@@ -92,6 +94,8 @@ namespace dxvk {
         m_gammaSlice = m_gammaBuffer->allocSlice();
 
       std::memcpy(m_gammaSlice.mapPtr, cpData, size);
+      if (winehuaFlushDynamicMapped())
+        m_gammaBuffer->flushMappedSlice(m_gammaSlice);
     } else {
       m_gammaBuffer = nullptr;
       m_gammaSlice = DxvkBufferSliceHandle();
@@ -109,6 +113,25 @@ namespace dxvk {
           VkRect2D            dstRect,
     const Rc<DxvkImageView>&  srcView,
           VkRect2D            srcRect) {
+    const bool sourceSrgb = imageFormatInfo(srcView->imageInfo().format)
+      ->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+    const bool destinationSrgb = imageFormatInfo(dstView->imageInfo().format)
+      ->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+    const bool encodeSrgb = sourceSrgb && !destinationSrgb;
+
+    if (winehuaPresentImageTraceEnabled()) {
+      static std::atomic<uint32_t> traceCount { 0 };
+      const uint32_t index = traceCount.fetch_add(1, std::memory_order_relaxed);
+      if (index < 64) {
+        Logger::info(str::format(
+          "WineHuaPresentFormat: source=", uint32_t(srcView->imageInfo().format),
+          " destination=", uint32_t(dstView->imageInfo().format),
+          " sourceSrgb=", sourceSrgb ? 1 : 0,
+          " destinationSrgb=", destinationSrgb ? 1 : 0,
+          " encodeSrgb=", encodeSrgb ? 1 : 0));
+      }
+    }
+
     DxvkInputAssemblyState iaState;
     iaState.primitiveTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     iaState.primitiveRestart  = VK_FALSE;
@@ -200,8 +223,9 @@ namespace dxvk {
     ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, m_vs);
     ctx->bindShader(VK_SHADER_STAGE_FRAGMENT_BIT, fs);
 
-    PresenterArgs args;
+    PresenterArgs args = { };
     args.srcOffset = srcRect.offset;
+    args.encodeSrgb = encodeSrgb;
 
     if (dstRect.extent == srcRect.extent)
       args.dstOffset = dstRect.offset;

@@ -1,11 +1,36 @@
+#include <algorithm>
 #include <cstring>
+#include <fstream>
+#if defined(DXVK_NATIVE_OHOS)
+#include <unistd.h>
+#define _getpid getpid
+#else
+#include <process.h>
+#endif
+#include <string>
 #include <vector>
 #include <utility>
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+#include "dxvk_winehua_trace.h"
+#include "../dxbc/dxbc_util.h"
+#include "../util/util_string.h"
 
 namespace dxvk {
+
+  static bool winehuaTraceDepthFormat(VkFormat format) {
+    return format == VK_FORMAT_D16_UNORM
+        || format == VK_FORMAT_X8_D24_UNORM_PACK32
+        || format == VK_FORMAT_D32_SFLOAT
+        || format == VK_FORMAT_D16_UNORM_S8_UINT
+        || format == VK_FORMAT_D24_UNORM_S8_UINT
+        || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+  }
+
+  static bool winehuaTraceDepthView(const Rc<DxvkImageView>& view) {
+    return view != nullptr && winehuaTraceDepthFormat(view->imageInfo().format);
+  }
   
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
   : m_device      (device),
@@ -91,6 +116,962 @@ namespace dxvk {
     this->beginRecording(
       m_device->createCommandList());
   }
+
+
+  VkResult DxvkContext::flushMappedBuffer(
+    const Rc<DxvkBuffer>&          buffer,
+    const DxvkBufferSliceHandle&   slice) {
+    return buffer->flushMappedSlice(slice, m_cmd.operator->());
+  }
+
+
+  VkResult DxvkContext::flushMappedImage(
+    const Rc<DxvkImage>&           image,
+          VkDeviceSize             offset,
+          VkDeviceSize             length) {
+    return image->flushMappedRange(offset, length, m_cmd.operator->());
+  }
+
+
+  void DxvkContext::winehuaTracePresentCopy(
+          uint64_t              frameId,
+          uint32_t              destinationIndex,
+          VkImage               sourceImage,
+          VkImage               destinationImage,
+          VkSampleCountFlagBits sourceSamples) {
+    if (winehuaPresentImageTraceEnabled() && m_cmd != nullptr) {
+      m_cmd->winehuaTracePresentCopy(
+        frameId, destinationIndex, sourceImage,
+        destinationImage, sourceSamples);
+    }
+  }
+
+
+  void DxvkContext::winehuaFrameBoundary(uint64_t nextFrameId) {
+    if (winehuaRenderTargetDumpEnabled()) {
+      if (m_winehuaFrameId == winehuaRenderTargetDumpFrame())
+        this->winehuaWriteRenderTargetDumps();
+      else
+        m_winehuaRenderTargetDumps.clear();
+
+      if (m_winehuaFrameId == winehuaRenderTargetDumpFrame())
+        this->winehuaWriteGeometryDumps();
+      else {
+        m_winehuaGeometryDumps.clear();
+        m_winehuaGeometryStateJson.clear();
+      }
+
+      if (nextFrameId == winehuaRenderTargetDumpFrame()) {
+        Logger::info(str::format(
+          "WineHuaRenderTargetDump: armed frame=", nextFrameId,
+          " maxAttachments=", winehuaRenderTargetDumpMaxAttachments(),
+          " maxBytes=", winehuaRenderTargetDumpMaxBytes(),
+          " sampled=", winehuaRenderTargetDumpSampledEnabled() ? 1 : 0,
+          " path=", winehuaRenderTargetDumpPath()));
+      }
+    }
+
+    if (winehuaDrawTraceEnabled()
+     && nextFrameId == winehuaRenderTargetDumpFrame()) {
+      Logger::info(str::format(
+        "WineHuaDraw: armed frame=", nextFrameId,
+        " pass=", winehuaDrawTracePass(),
+        " secondPass=", winehuaDrawTraceSecondPass(),
+        " maxDraws=", winehuaDrawTraceMaxDraws(),
+        " draw=", winehuaRenderTargetDumpDraw(),
+        " fs=", winehuaRenderTargetDumpFragmentShader(),
+        " indexCount=", winehuaRenderTargetDumpIndexCount(),
+        " firstIndex=", winehuaRenderTargetDumpFirstIndex(),
+        " vertexOffset=", winehuaRenderTargetDumpVertexOffset()));
+    }
+
+    m_winehuaFrameId = nextFrameId;
+    m_winehuaPassId = 0;
+    m_winehuaActivePassId = 0;
+    m_winehuaFrameDrawId = 0;
+    m_winehuaPassDrawId = 0;
+    m_winehuaLastPassDrawId = UINT32_MAX;
+    m_winehuaTraceDrawsEmitted = 0;
+    m_winehuaTargetDrawCaptured = false;
+    m_winehuaSecondTargetDrawCaptured = false;
+    m_winehuaDumpBytes = 0;
+    m_winehuaGeometryBytes = 0;
+    m_winehuaGeometryStateJson.clear();
+    m_winehuaLastGraphicsResourceViews = "[]";
+    m_winehuaLastGraphicsImages.clear();
+  }
+
+
+  void DxvkContext::winehuaTraceDraw(
+    const char*         drawType,
+    const std::string&  arguments) {
+    if (winehuaCameraTraceEnabled()
+     && m_winehuaCameraTraceFrame != m_winehuaFrameId
+     && m_winehuaActivePassId == 0) {
+      bool emitted = false;
+      for (const auto& binding : m_winehuaGraphicsBindings) {
+        if (binding.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+         && binding.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+          continue;
+
+        if (!binding.bufferSlice.defined())
+          continue;
+
+        const DxvkBufferSliceHandle slice = binding.bufferSlice.getSliceHandle();
+        if (!slice.mapPtr || !slice.length)
+          continue;
+
+        const uint64_t byteCount = std::min<uint64_t>(slice.length, 4096u);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(slice.mapPtr);
+        uint64_t contentHash = 1469598103934665603ull;
+        for (uint64_t i = 0; i < byteCount; i++) {
+          contentHash ^= bytes[i];
+          contentHash *= 1099511628211ull;
+        }
+
+        std::string words = "[";
+        const uint32_t wordCount = uint32_t(
+          std::min<uint64_t>(byteCount, 64u) / sizeof(uint32_t));
+        for (uint32_t i = 0; i < wordCount; i++) {
+          uint32_t word = 0;
+          std::memcpy(&word, bytes + i * sizeof(uint32_t), sizeof(word));
+          if (i)
+            words += ',';
+          words += str::format("0x", std::hex, word);
+        }
+        words += ']';
+
+        Logger::info(str::format(
+          "WineHuaUbo: winPid=", _getpid(),
+          " recording=", m_cmd->winehuaRecordingId(),
+          " frame=", m_winehuaFrameId,
+          " pass=", m_winehuaActivePassId,
+          " guestCmd=0x", std::hex,
+            reinterpret_cast<uintptr_t>(m_cmd->winehuaExecBuffer()),
+          " descriptorSet=0x", m_gpSet,
+          " binding=", binding.binding,
+          " resourceSlot=", binding.resourceSlot,
+          " descriptorType=", binding.descriptorType,
+          " stages=0x", std::hex, binding.stages,
+          " writtenHandle=0x", binding.buffer.buffer,
+          " writtenBaseOffset=", std::dec, binding.buffer.offset,
+          " writtenRange=", binding.buffer.range,
+          " dynamicOffsetBound=", binding.dynamicOffsetBound ? 1 : 0,
+          " dynamicOffset=", binding.dynamicOffset,
+          " sliceHandle=0x", std::hex, slice.handle,
+          " sliceOffset=", std::dec, slice.offset,
+          " sliceLength=", slice.length,
+          " bytes=", byteCount,
+          " hash=0x", std::hex, contentHash,
+          " words=", words));
+        emitted = true;
+      }
+
+      if (emitted) {
+        m_cmd->winehuaTraceFrame(m_winehuaFrameId);
+        m_winehuaCameraTraceFrame = m_winehuaFrameId;
+      }
+    }
+
+    if (!winehuaDrawTraceEnabled()
+     || m_winehuaFrameId != winehuaRenderTargetDumpFrame())
+      return;
+
+    const uint32_t frameDrawId = m_winehuaFrameDrawId++;
+    const uint32_t passDrawId = m_winehuaPassDrawId++;
+    m_winehuaLastPassDrawId = passDrawId;
+    const uint32_t selectedPass = winehuaDrawTracePass();
+
+    if ((selectedPass != UINT32_MAX && m_winehuaActivePassId != selectedPass)
+     || m_winehuaTraceDrawsEmitted >= winehuaDrawTraceMaxDraws())
+      return;
+
+    m_winehuaTraceDrawsEmitted++;
+
+    const std::string vertexShader = m_state.gp.shaders.vs != nullptr
+      ? m_state.gp.shaders.vs->debugName() : std::string();
+    const std::string fragmentShader = m_state.gp.shaders.fs != nullptr
+      ? m_state.gp.shaders.fs->debugName() : std::string();
+
+    std::string pushWords = "[]";
+    uint32_t pushOffset = 0;
+    uint32_t pushSize = 0;
+    if (m_state.gp.pipeline != nullptr && m_state.gp.pipeline->layout() != nullptr) {
+      const VkPushConstantRange range = m_state.gp.pipeline->layout()->pushConstRange();
+      pushOffset = range.offset;
+      pushSize = range.size;
+      if (range.size) {
+        pushWords = "[";
+        const uint32_t wordCount = std::min(range.size, 64u) / sizeof(uint32_t);
+        for (uint32_t i = 0; i < wordCount; i++) {
+          uint32_t word = 0;
+          std::memcpy(&word,
+            &m_state.pc.data[range.offset + i * sizeof(uint32_t)],
+            sizeof(word));
+          if (i)
+            pushWords += ',';
+          pushWords += str::format("0x", std::hex, word);
+        }
+        pushWords += ']';
+      }
+    }
+
+    Logger::info(str::format(
+      "WineHuaDraw: frame=", m_winehuaFrameId,
+      " pass=", m_winehuaActivePassId,
+      " draw=", passDrawId,
+      " frameDraw=", frameDrawId,
+      " type=", drawType,
+      " ", arguments,
+      " pipeline=0x", std::hex, m_gpActivePipeline,
+      " descriptorSet=0x", m_gpSet,
+      " descriptorUpdate=", std::dec, m_winehuaDescriptorUpdateSerial,
+      " descriptorBind=", m_winehuaDescriptorBindSerial,
+      " vs=", vertexShader,
+      " fs=", fragmentShader,
+      " viewport=", m_state.vp.viewports[0].x, ",",
+                       m_state.vp.viewports[0].y, ",",
+                       m_state.vp.viewports[0].width, ",",
+                       m_state.vp.viewports[0].height,
+      " scissor=", m_state.vp.scissorRects[0].offset.x, ",",
+                      m_state.vp.scissorRects[0].offset.y, ",",
+                      m_state.vp.scissorRects[0].extent.width, ",",
+                      m_state.vp.scissorRects[0].extent.height,
+      " pushOffset=", pushOffset,
+      " pushSize=", pushSize,
+      " pushWords=", pushWords));
+
+    for (const auto& binding : m_winehuaGraphicsBindings) {
+      const auto& current = m_rc[binding.resourceSlot];
+
+      if (binding.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER
+       || binding.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+       || binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+       || binding.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+        Rc<DxvkSampler> currentSampler = current.sampler;
+        uint32_t currentSamplerSlot = binding.resourceSlot;
+
+        if (binding.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+          const uint32_t stageSlot = binding.resourceSlot % DxbcStageBindingCount;
+          if (currentSampler == nullptr
+           && stageSlot >= DxbcResourceBindingIndex
+           && stageSlot < DxbcResourceBindingIndex + DxbcResourceBindingCount) {
+            currentSamplerSlot = binding.resourceSlot
+              - (DxbcResourceBindingIndex - DxbcSamplerBindingIndex);
+            currentSampler = m_rc[currentSamplerSlot].sampler;
+          }
+        }
+
+        const Rc<DxvkImageView>& currentView = current.imageView;
+        const VkImageView currentViewHandle = currentView != nullptr
+          ? currentView->handle(binding.viewType) : VK_NULL_HANDLE;
+        const VkSampler currentSamplerHandle = currentSampler != nullptr
+          ? currentSampler->handle() : VK_NULL_HANDLE;
+        const uint64_t writtenViewCookie = binding.imageView != nullptr
+          ? binding.imageView->cookie() : 0;
+        const uint64_t currentViewCookie = currentView != nullptr
+          ? currentView->cookie() : 0;
+        const VkImage writtenImage = binding.imageView != nullptr
+          ? binding.imageView->imageHandle() : VK_NULL_HANDLE;
+        const VkImage currentImage = currentView != nullptr
+          ? currentView->imageHandle() : VK_NULL_HANDLE;
+
+        Logger::info(str::format(
+          "WineHuaDrawBinding: frame=", m_winehuaFrameId,
+          " pass=", m_winehuaActivePassId,
+          " draw=", passDrawId,
+          " binding=", binding.binding,
+          " resourceSlot=", binding.resourceSlot,
+          " samplerSlot=", currentSamplerSlot,
+          " descriptorType=", binding.descriptorType,
+          " stages=0x", std::hex, binding.stages,
+          " viewType=", std::dec, binding.viewType,
+          " writtenImageView=0x", std::hex, binding.image.imageView,
+          " writtenSampler=0x", binding.image.sampler,
+          " writtenLayout=", std::dec, binding.image.imageLayout,
+          " writtenViewCookie=", writtenViewCookie,
+          " writtenImage=0x", std::hex, writtenImage,
+          " currentImageView=0x", currentViewHandle,
+          " currentSampler=0x", currentSamplerHandle,
+          " currentViewCookie=", std::dec, currentViewCookie,
+          " currentImage=0x", std::hex, currentImage,
+          " imageIdentityMatch=", std::dec,
+            binding.image.imageView == currentViewHandle ? 1 : 0,
+          " samplerIdentityMatch=",
+            binding.image.sampler == currentSamplerHandle ? 1 : 0,
+          " compareEnable=", binding.sampler != nullptr
+            ? binding.sampler->compareToDepth() : VK_FALSE,
+          " compareOp=", binding.sampler != nullptr
+            ? binding.sampler->compareOp() : VK_COMPARE_OP_NEVER,
+          " currentCompareEnable=", currentSampler != nullptr
+            ? currentSampler->compareToDepth() : VK_FALSE,
+          " currentCompareOp=", currentSampler != nullptr
+            ? currentSampler->compareOp() : VK_COMPARE_OP_NEVER,
+          " imageFormat=", binding.imageView != nullptr
+            ? binding.imageView->imageInfo().format : VK_FORMAT_UNDEFINED,
+          " viewFormat=", binding.imageView != nullptr
+            ? binding.imageView->info().format : VK_FORMAT_UNDEFINED,
+          " aspect=0x", std::hex, binding.imageView != nullptr
+            ? binding.imageView->info().aspect : 0,
+          " baseMip=", std::dec, binding.imageView != nullptr
+            ? binding.imageView->info().minLevel : 0,
+          " mipCount=", binding.imageView != nullptr
+            ? binding.imageView->info().numLevels : 0,
+          " baseLayer=", binding.imageView != nullptr
+            ? binding.imageView->info().minLayer : 0,
+          " layerCount=", binding.imageView != nullptr
+            ? binding.imageView->info().numLayers : 0));
+      } else if (binding.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+              || binding.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+              || binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+        const DxvkBufferSliceHandle writtenSlice = binding.bufferSlice.defined()
+          ? binding.bufferSlice.getSliceHandle() : DxvkBufferSliceHandle();
+        const DxvkBufferSliceHandle currentSlice = current.bufferSlice.defined()
+          ? current.bufferSlice.getSliceHandle() : DxvkBufferSliceHandle();
+        const VkDeviceSize effectiveOffset = binding.buffer.offset
+          + (binding.dynamicOffsetBound ? binding.dynamicOffset : 0);
+
+        std::string words = "[]";
+        uint64_t contentHash = 1469598103934665603ull;
+        uint64_t hashBytes = 0;
+        bool mapped = false;
+        if (binding.bufferSlice.defined()
+         && (binding.bufferSlice.buffer()->memFlags()
+           & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         && writtenSlice.mapPtr != nullptr) {
+          mapped = true;
+          hashBytes = std::min<uint64_t>(writtenSlice.length, 4096u);
+          const auto* bytes = reinterpret_cast<const uint8_t*>(writtenSlice.mapPtr);
+          for (uint64_t i = 0; i < hashBytes; i++) {
+            contentHash ^= bytes[i];
+            contentHash *= 1099511628211ull;
+          }
+
+          words = "[";
+          const uint32_t wordCount = uint32_t(
+            std::min<VkDeviceSize>(writtenSlice.length, 64u) / sizeof(uint32_t));
+          for (uint32_t i = 0; i < wordCount; i++) {
+            uint32_t word = 0;
+            std::memcpy(&word, bytes + i * sizeof(uint32_t), sizeof(word));
+            if (i)
+              words += ',';
+            words += str::format("0x", std::hex, word);
+          }
+          words += ']';
+        }
+
+        Logger::info(str::format(
+          "WineHuaDrawBuffer: frame=", m_winehuaFrameId,
+          " pass=", m_winehuaActivePassId,
+          " draw=", passDrawId,
+          " binding=", binding.binding,
+          " resourceSlot=", binding.resourceSlot,
+          " descriptorType=", binding.descriptorType,
+          " stages=0x", std::hex, binding.stages,
+          " writtenHandle=0x", binding.buffer.buffer,
+          " writtenBaseOffset=", std::dec, binding.buffer.offset,
+          " writtenRange=", binding.buffer.range,
+          " dynamicOffsetBound=", binding.dynamicOffsetBound ? 1 : 0,
+          " dynamicOffset=", binding.dynamicOffset,
+          " effectiveOffset=", effectiveOffset,
+          " sliceHandle=0x", std::hex, writtenSlice.handle,
+          " sliceOffset=", std::dec, writtenSlice.offset,
+          " sliceLength=", writtenSlice.length,
+          " currentHandle=0x", std::hex, currentSlice.handle,
+          " currentOffset=", std::dec, currentSlice.offset,
+          " currentLength=", currentSlice.length,
+          " identityMatch=", writtenSlice.handle == currentSlice.handle
+            && writtenSlice.offset == currentSlice.offset
+            && writtenSlice.length == currentSlice.length ? 1 : 0,
+          " mapped=", mapped ? 1 : 0,
+          " hashBytes=", hashBytes,
+          " contentHash=0x", std::hex, contentHash,
+          " words=", words));
+      } else {
+        Logger::info(str::format(
+          "WineHuaDrawBinding: frame=", m_winehuaFrameId,
+          " pass=", m_winehuaActivePassId,
+          " draw=", passDrawId,
+          " binding=", binding.binding,
+          " resourceSlot=", binding.resourceSlot,
+          " descriptorType=", binding.descriptorType,
+          " stages=0x", std::hex, binding.stages,
+          " texelBuffer=0x", binding.texelBuffer));
+      }
+    }
+  }
+
+
+  void DxvkContext::winehuaCaptureTargetDraw(
+    bool indexed,
+    uint32_t count,
+    uint32_t first,
+    int32_t vertexOffset,
+    uint32_t instanceCount,
+    uint32_t firstInstance) {
+    if (!winehuaTargetDrawCaptureEnabled()
+     || m_winehuaFrameId != winehuaRenderTargetDumpFrame())
+      return;
+
+    const uint32_t selectedPass = winehuaDrawTracePass();
+    const uint32_t secondPass = winehuaDrawTraceSecondPass();
+    const bool matchesPrimary = selectedPass == UINT32_MAX
+      || m_winehuaActivePassId == selectedPass;
+    const bool matchesSecond = secondPass != UINT32_MAX
+      && m_winehuaActivePassId == secondPass;
+    if (!matchesPrimary && !matchesSecond)
+      return;
+    if ((matchesSecond && m_winehuaSecondTargetDrawCaptured)
+     || (!matchesSecond && m_winehuaTargetDrawCaptured))
+      return;
+
+    const char* targetFragmentShader = winehuaRenderTargetDumpFragmentShader();
+    const std::string vertexShader = m_state.gp.shaders.vs != nullptr
+      ? m_state.gp.shaders.vs->debugName() : std::string();
+    const std::string fragmentShader = m_state.gp.shaders.fs != nullptr
+      ? m_state.gp.shaders.fs->debugName() : std::string();
+    if (targetFragmentShader[0]) {
+      const uint64_t targetCount = winehuaRenderTargetDumpIndexCount();
+      const uint64_t targetFirst = winehuaRenderTargetDumpFirstIndex();
+      const int64_t targetVertexOffset = winehuaRenderTargetDumpVertexOffset();
+      if (!indexed
+       || fragmentShader != targetFragmentShader
+       || (targetCount != UINT64_MAX && count != targetCount)
+       || (targetFirst != UINT64_MAX && first != targetFirst)
+       || (targetVertexOffset != INT64_MIN && vertexOffset != targetVertexOffset))
+        return;
+    } else if (m_winehuaLastPassDrawId != winehuaRenderTargetDumpDraw()) {
+      return;
+    }
+
+    if (matchesSecond)
+      m_winehuaSecondTargetDrawCaptured = true;
+    else
+      m_winehuaTargetDrawCaptured = true;
+    Logger::info(str::format(
+      "WineHuaDrawCapture: frame=", m_winehuaFrameId,
+      " pass=", m_winehuaActivePassId,
+      " draw=", m_winehuaLastPassDrawId,
+      " indexed=", indexed ? 1 : 0,
+      " count=", count,
+      " first=", first,
+      " vertexOffset=", vertexOffset,
+      " instanceCount=", instanceCount,
+      " firstInstance=", firstInstance,
+      " vs=", vertexShader,
+      " fs=", fragmentShader,
+      " ending render pass for diagnostic capture"));
+    const VkPipeline capturedPipeline = m_gpActivePipeline;
+    const VkDescriptorSet capturedDescriptorSet = m_gpSet;
+    this->spillRenderPass(false);
+
+    const auto& pipelineState = m_state.gp.state;
+    const auto& viewport = m_state.vp.viewports[0];
+    const auto& scissor = m_state.vp.scissorRects[0];
+    const auto frontStencil = pipelineState.dsFront.state();
+    const auto backStencil = pipelineState.dsBack.state();
+    const VkSampleCountFlags sampleCount = pipelineState.ms.sampleCount()
+      ? pipelineState.ms.sampleCount() : pipelineState.rs.sampleCount();
+    const VkPushConstantRange pushRange = m_state.gp.pipeline != nullptr
+      && m_state.gp.pipeline->layout() != nullptr
+      ? m_state.gp.pipeline->layout()->pushConstRange()
+      : VkPushConstantRange { };
+
+    std::string stateJson = str::format(
+      "{\"frame\":", m_winehuaFrameId,
+      ",\"pass\":", m_winehuaActivePassId,
+      ",\"draw\":", m_winehuaLastPassDrawId,
+      ",\"kind\":\"pipeline-state\"",
+      ",\"pipeline\":", uint64_t(capturedPipeline),
+      ",\"descriptorSet\":", uint64_t(capturedDescriptorSet),
+      ",\"vertexShader\":\"", vertexShader, "\"",
+      ",\"fragmentShader\":\"", fragmentShader, "\"",
+      ",\"inputAssembly\":{\"topology\":", uint32_t(pipelineState.ia.primitiveTopology()),
+      ",\"primitiveRestart\":", pipelineState.ia.primitiveRestart() ? "true" : "false",
+      ",\"patchVertexCount\":", pipelineState.ia.patchVertexCount(), "}",
+      ",\"rasterizer\":{\"depthClipEnable\":", pipelineState.rs.depthClipEnable() ? "true" : "false",
+      ",\"depthBiasEnable\":", pipelineState.rs.depthBiasEnable() ? "true" : "false",
+      ",\"polygonMode\":", uint32_t(pipelineState.rs.polygonMode()),
+      ",\"cullMode\":", uint32_t(pipelineState.rs.cullMode()),
+      ",\"frontFace\":", uint32_t(pipelineState.rs.frontFace()),
+      ",\"viewportCount\":", pipelineState.rs.viewportCount(), "}",
+      ",\"multisample\":{\"sampleCount\":", uint32_t(sampleCount),
+      ",\"sampleMask\":", pipelineState.ms.sampleMask(),
+      ",\"alphaToCoverage\":", pipelineState.ms.enableAlphaToCoverage() ? "true" : "false", "}",
+      ",\"depthStencil\":{\"depthTest\":", pipelineState.ds.enableDepthTest() ? "true" : "false",
+      ",\"depthWrite\":", pipelineState.ds.enableDepthWrite() ? "true" : "false",
+      ",\"depthBoundsTest\":", pipelineState.ds.enableDepthBoundsTest() ? "true" : "false",
+      ",\"stencilTest\":", pipelineState.ds.enableStencilTest() ? "true" : "false",
+      ",\"depthCompareOp\":", uint32_t(pipelineState.ds.depthCompareOp()),
+      ",\"front\":[", uint32_t(frontStencil.failOp), ",", uint32_t(frontStencil.passOp),
+      ",", uint32_t(frontStencil.depthFailOp), ",", uint32_t(frontStencil.compareOp),
+      ",", frontStencil.compareMask, ",", frontStencil.writeMask, ",", m_state.dyn.stencilReference, "]",
+      ",\"back\":[", uint32_t(backStencil.failOp), ",", uint32_t(backStencil.passOp),
+      ",", uint32_t(backStencil.depthFailOp), ",", uint32_t(backStencil.compareOp),
+      ",", backStencil.compareMask, ",", backStencil.writeMask, ",", m_state.dyn.stencilReference, "]}",
+      ",\"viewport\":[", viewport.x, ",", viewport.y, ",", viewport.width, ",", viewport.height,
+      ",", viewport.minDepth, ",", viewport.maxDepth, "]",
+      ",\"scissor\":[", scissor.offset.x, ",", scissor.offset.y, ",",
+      scissor.extent.width, ",", scissor.extent.height, "]",
+      ",\"dynamic\":{\"depthBias\":[", m_state.dyn.depthBias.depthBiasConstant, ",",
+      m_state.dyn.depthBias.depthBiasClamp, ",", m_state.dyn.depthBias.depthBiasSlope, "]",
+      ",\"depthBounds\":[", m_state.dyn.depthBounds.minDepthBounds, ",",
+      m_state.dyn.depthBounds.maxDepthBounds, "]",
+      ",\"blendConstants\":[", m_state.dyn.blendConstants.r, ",", m_state.dyn.blendConstants.g,
+      ",", m_state.dyn.blendConstants.b, ",", m_state.dyn.blendConstants.a, "]}",
+      ",\"outputMerger\":{\"logicOpEnable\":", pipelineState.om.enableLogicOp() ? "true" : "false",
+      ",\"logicOp\":", uint32_t(pipelineState.om.logicOp()),
+      ",\"colorFormats\":[");
+
+    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
+      if (i)
+        stateJson += ',';
+      const auto& target = m_state.om.renderTargets.color[i];
+      stateJson += str::format(target.view != nullptr
+        ? uint32_t(target.view->info().format) : uint32_t(VK_FORMAT_UNDEFINED));
+    }
+
+    const auto& depthTarget = m_state.om.renderTargets.depth;
+    stateJson += str::format(
+      "],\"depthFormat\":", depthTarget.view != nullptr
+        ? uint32_t(depthTarget.view->info().format) : uint32_t(VK_FORMAT_UNDEFINED),
+      ",\"blendAttachments\":[");
+    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
+      if (i)
+        stateJson += ',';
+      const auto blend = pipelineState.omBlend[i].state();
+      stateJson += str::format(
+        "{\"blendEnable\":", blend.blendEnable ? "true" : "false",
+        ",\"srcColor\":", uint32_t(blend.srcColorBlendFactor),
+        ",\"dstColor\":", uint32_t(blend.dstColorBlendFactor),
+        ",\"colorOp\":", uint32_t(blend.colorBlendOp),
+        ",\"srcAlpha\":", uint32_t(blend.srcAlphaBlendFactor),
+        ",\"dstAlpha\":", uint32_t(blend.dstAlphaBlendFactor),
+        ",\"alphaOp\":", uint32_t(blend.alphaBlendOp),
+        ",\"writeMask\":", uint32_t(blend.colorWriteMask),
+        ",\"swizzle\":[", pipelineState.omSwizzle[i].rIndex(), ",",
+        pipelineState.omSwizzle[i].gIndex(), ",", pipelineState.omSwizzle[i].bIndex(), ",",
+        pipelineState.omSwizzle[i].aIndex(), "]}");
+    }
+    stateJson += "]}";
+
+    stateJson += ",\"vertexBindings\":[";
+    for (uint32_t i = 0; i < pipelineState.il.bindingCount(); i++) {
+      if (i)
+        stateJson += ',';
+      const auto& binding = pipelineState.ilBindings[i];
+      const uint32_t sourceBinding = binding.binding();
+      stateJson += str::format(
+        "{\"pipelineBinding\":", i,
+        ",\"sourceBinding\":", sourceBinding,
+        ",\"pipelineStride\":", binding.stride(),
+        ",\"boundStride\":", m_state.vi.vertexStrides[sourceBinding],
+        ",\"inputRate\":", uint32_t(binding.inputRate()),
+        ",\"divisor\":", binding.divisor(), "}");
+    }
+    stateJson += "],\"vertexAttributes\":[";
+    for (uint32_t i = 0; i < pipelineState.il.attributeCount(); i++) {
+      if (i)
+        stateJson += ',';
+      const auto& attribute = pipelineState.ilAttributes[i];
+      stateJson += str::format(
+        "{\"location\":", attribute.location(),
+        ",\"sourceBinding\":", attribute.binding(),
+        ",\"format\":", uint32_t(attribute.format()),
+        ",\"offset\":", attribute.offset(), "}");
+    }
+    stateJson += "],\"descriptorBindings\":[";
+    for (size_t i = 0; i < m_winehuaGraphicsBindings.size(); i++) {
+      if (i)
+        stateJson += ',';
+      const auto& binding = m_winehuaGraphicsBindings[i];
+      stateJson += str::format(
+        "{\"binding\":", binding.binding,
+        ",\"resourceSlot\":", binding.resourceSlot,
+        ",\"type\":", uint32_t(binding.descriptorType),
+        ",\"stages\":", uint32_t(binding.stages),
+        ",\"viewType\":", uint32_t(binding.viewType), "}");
+    }
+    stateJson += "],\"samplers\":[";
+    bool firstSampler = true;
+    for (const auto& binding : m_winehuaGraphicsBindings) {
+      if (binding.sampler == nullptr)
+        continue;
+      if (!firstSampler)
+        stateJson += ',';
+      const auto& sampler = binding.sampler->info();
+      const auto& border = binding.sampler->customBorderColor();
+      stateJson += str::format(
+        "{\"binding\":", binding.binding,
+        ",\"resourceSlot\":", binding.resourceSlot,
+        ",\"flags\":", uint32_t(sampler.flags),
+        ",\"magFilter\":", uint32_t(sampler.magFilter),
+        ",\"minFilter\":", uint32_t(sampler.minFilter),
+        ",\"mipmapMode\":", uint32_t(sampler.mipmapMode),
+        ",\"addressModeU\":", uint32_t(sampler.addressModeU),
+        ",\"addressModeV\":", uint32_t(sampler.addressModeV),
+        ",\"addressModeW\":", uint32_t(sampler.addressModeW),
+        ",\"mipLodBias\":", sampler.mipLodBias,
+        ",\"anisotropyEnable\":", sampler.anisotropyEnable ? "true" : "false",
+        ",\"maxAnisotropy\":", sampler.maxAnisotropy,
+        ",\"compareEnable\":", sampler.compareEnable ? "true" : "false",
+        ",\"compareOp\":", uint32_t(sampler.compareOp),
+        ",\"minLod\":", sampler.minLod,
+        ",\"maxLod\":", sampler.maxLod,
+        ",\"borderColor\":", uint32_t(sampler.borderColor),
+        ",\"customBorder\":[", border.float32[0], ",", border.float32[1], ",",
+        border.float32[2], ",", border.float32[3], "]",
+        ",\"unnormalizedCoordinates\":", sampler.unnormalizedCoordinates ? "true" : "false", "}");
+      firstSampler = false;
+    }
+    stateJson += "],\"specializationConstants\":[";
+    for (uint32_t i = 0; i < MaxNumSpecConstants; i++) {
+      if (i)
+        stateJson += ',';
+      stateJson += str::format(pipelineState.sc.specConstants[i]);
+    }
+    stateJson += str::format(
+      "],\"pushConstantOffset\":", pushRange.offset,
+      ",\"pushConstantSize\":", pushRange.size,
+      ",\"pushConstantWords\":[");
+    const uint32_t pushWordCount = std::min(pushRange.size, 64u) / sizeof(uint32_t);
+    for (uint32_t i = 0; i < pushWordCount; i++) {
+      if (i)
+        stateJson += ',';
+      uint32_t word = 0;
+      std::memcpy(&word, &m_state.pc.data[pushRange.offset + i * sizeof(uint32_t)], sizeof(word));
+      stateJson += str::format(word);
+    }
+    stateJson += "]}";
+    m_winehuaGeometryStateJson += stateJson;
+    m_winehuaGeometryStateJson += '\n';
+
+    const uint64_t maxBytes = winehuaGeometryDumpMaxBytes();
+    const uint32_t indexSize = indexed
+      ? (m_state.vi.indexType == VK_INDEX_TYPE_UINT16 ? 2u
+       : m_state.vi.indexType == VK_INDEX_TYPE_UINT32 ? 4u : 0u)
+      : 0u;
+
+    auto captureBuffer = [&](const char* kind, uint32_t binding,
+                             uint32_t resourceSlot,
+                             VkDescriptorType descriptorType,
+                             VkShaderStageFlags stages,
+                             VkDeviceSize dynamicOffset,
+                             const DxvkBufferSlice& source,
+                             VkDeviceSize relativeOffset,
+                             VkDeviceSize requestedLength,
+                             uint32_t stride) {
+      if (!source.defined() || !requestedLength
+       || relativeOffset >= source.length()
+       || m_winehuaGeometryBytes >= maxBytes)
+        return;
+
+      const VkDeviceSize available = source.length() - relativeOffset;
+      const VkDeviceSize remaining = maxBytes - m_winehuaGeometryBytes;
+      const VkDeviceSize length = std::min(
+        std::min(available, requestedLength), remaining);
+      if (!length)
+        return;
+
+      DxvkBufferCreateInfo info = { };
+      info.size = length;
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                 | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+      auto dumpBuffer = m_device->createBuffer(info,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      auto sourceSlice = source.getSliceHandle(relativeOffset, length);
+      auto dumpSlice = dumpBuffer->getSliceHandle();
+
+      if (m_execBarriers.isBufferDirty(sourceSlice, DxvkAccess::Read))
+        m_execBarriers.recordCommands(m_cmd);
+
+      VkBufferCopy region;
+      region.srcOffset = sourceSlice.offset;
+      region.dstOffset = dumpSlice.offset;
+      region.size = length;
+      m_cmd->cmdCopyBuffer(DxvkCmdBuffer::ExecBuffer,
+        sourceSlice.handle, dumpSlice.handle, 1, &region);
+
+      m_execBarriers.accessBuffer(sourceSlice,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        source.bufferInfo().stages,
+        source.bufferInfo().access);
+      m_cmd->trackResource<DxvkAccess::Read>(source.buffer());
+      m_cmd->trackResource<DxvkAccess::Write>(dumpBuffer);
+
+      WineHuaGeometryDump dump;
+      dump.kind = kind;
+      dump.frameId = m_winehuaFrameId;
+      dump.passId = m_winehuaActivePassId;
+      dump.drawId = m_winehuaLastPassDrawId;
+      dump.binding = binding;
+      dump.resourceSlot = resourceSlot;
+      dump.descriptorType = descriptorType;
+      dump.stages = stages;
+      dump.indexed = indexed;
+      dump.indexType = m_state.vi.indexType;
+      dump.count = count;
+      dump.first = first;
+      dump.vertexOffset = vertexOffset;
+      dump.instanceCount = instanceCount;
+      dump.firstInstance = firstInstance;
+      dump.dynamicOffset = dynamicOffset;
+      dump.stride = stride;
+      dump.vertexShader = vertexShader;
+      dump.fragmentShader = fragmentShader;
+      dump.sourceHandle = sourceSlice.handle;
+      dump.sourceOffset = sourceSlice.offset;
+      dump.sourceLength = sourceSlice.length;
+      dump.dataSize = length;
+      dump.buffer = std::move(dumpBuffer);
+      m_winehuaGeometryBytes += length;
+      m_winehuaGeometryDumps.push_back(std::move(dump));
+
+      Logger::info(str::format(
+        "WineHuaGeometryCapture: frame=", m_winehuaFrameId,
+        " pass=", m_winehuaActivePassId,
+        " draw=", m_winehuaLastPassDrawId,
+        " kind=", kind,
+        " binding=", binding,
+        " resourceSlot=", resourceSlot,
+        " descriptorType=", descriptorType,
+        " stages=0x", std::hex, stages,
+        " source=0x", std::hex, sourceSlice.handle,
+        " offset=", std::dec, sourceSlice.offset,
+        " bytes=", length,
+        " total=", m_winehuaGeometryBytes));
+    };
+
+    if (indexed && indexSize) {
+      const auto& indexBuffer = m_state.vi.indexBuffer;
+      const VkDeviceSize relativeOffset = VkDeviceSize(first) * indexSize;
+      const VkDeviceSize requestedLength = VkDeviceSize(count) * indexSize;
+      captureBuffer("index", UINT32_MAX, UINT32_MAX,
+        VK_DESCRIPTOR_TYPE_MAX_ENUM, 0, 0, indexBuffer,
+        relativeOffset, requestedLength, indexSize);
+    }
+
+    for (uint32_t i = 0; i < m_state.gp.state.il.bindingCount(); i++) {
+      const uint32_t binding = m_state.gp.state.ilBindings[i].binding();
+      const auto& vertexBuffer = m_state.vi.vertexBuffers[binding];
+      captureBuffer("vertex", binding, UINT32_MAX,
+        VK_DESCRIPTOR_TYPE_MAX_ENUM, 0, 0, vertexBuffer, 0,
+        vertexBuffer.defined() ? vertexBuffer.length() : 0,
+        m_state.vi.vertexStrides[binding]);
+    }
+
+    for (const auto& binding : m_winehuaGraphicsBindings) {
+      if (binding.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+       && binding.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+       && binding.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+        continue;
+
+      const VkDeviceSize dynamicOffset = binding.dynamicOffsetBound
+        ? binding.dynamicOffset : 0;
+      captureBuffer("descriptor-buffer", binding.binding,
+        binding.resourceSlot, binding.descriptorType, binding.stages,
+        dynamicOffset, binding.bufferSlice, dynamicOffset,
+        binding.bufferSlice.defined()
+          && dynamicOffset < binding.bufferSlice.length()
+          ? binding.bufferSlice.length() - dynamicOffset : 0,
+        0);
+    }
+  }
+
+
+  void DxvkContext::winehuaWriteGeometryDumps() {
+    if (m_winehuaGeometryDumps.empty())
+      return;
+
+    const std::string basePath = winehuaRenderTargetDumpPath();
+    const std::string frameName = str::format("frame-", m_winehuaFrameId);
+    const std::string metadataPath = str::format(
+      basePath, "/", frameName, "-geometry.jsonl");
+    std::ofstream metadata(
+      str::tows(metadataPath.c_str()).c_str(),
+      std::ios_base::binary | std::ios_base::trunc);
+
+    if (!metadata) {
+      Logger::err(str::format(
+        "WineHuaGeometryCapture: cannot open metadata path=", metadataPath));
+      m_winehuaGeometryDumps.clear();
+      m_winehuaGeometryStateJson.clear();
+      return;
+    }
+
+    if (!m_winehuaGeometryStateJson.empty())
+      metadata << m_winehuaGeometryStateJson;
+
+    uint32_t filesWritten = 0;
+    for (auto& dump : m_winehuaGeometryDumps) {
+      if (dump.buffer == nullptr || !dump.dataSize)
+        continue;
+
+      const auto slice = dump.buffer->getSliceHandle();
+      m_device->waitForResource(dump.buffer, DxvkAccess::Write);
+      dump.buffer->invalidateMappedSlice(slice);
+
+      const std::string bindingSuffix = dump.binding == UINT32_MAX
+        ? std::string()
+        : str::format("-", dump.binding);
+      const std::string fileName = str::format(
+        frameName, "-pass-", dump.passId,
+        "-draw-", dump.drawId, "-", dump.kind,
+        bindingSuffix, ".bin");
+      const std::string dataPath = str::format(basePath, "/", fileName);
+      std::ofstream data(
+        str::tows(dataPath.c_str()).c_str(),
+        std::ios_base::binary | std::ios_base::trunc);
+      bool dataWritten = false;
+      if (data) {
+        data.write(reinterpret_cast<const char*>(slice.mapPtr), dump.dataSize);
+        dataWritten = data.good();
+        if (dataWritten)
+          filesWritten++;
+      }
+
+      metadata
+        << "{\"frame\":" << dump.frameId
+        << ",\"pass\":" << dump.passId
+        << ",\"draw\":" << dump.drawId
+        << ",\"kind\":\"" << dump.kind << "\""
+        << ",\"binding\":" << dump.binding
+        << ",\"resourceSlot\":" << dump.resourceSlot
+        << ",\"descriptorType\":" << uint32_t(dump.descriptorType)
+        << ",\"stages\":" << dump.stages
+        << ",\"indexed\":" << (dump.indexed ? "true" : "false")
+        << ",\"indexType\":" << uint32_t(dump.indexType)
+        << ",\"count\":" << dump.count
+        << ",\"first\":" << dump.first
+        << ",\"vertexOffset\":" << dump.vertexOffset
+        << ",\"instanceCount\":" << dump.instanceCount
+        << ",\"firstInstance\":" << dump.firstInstance
+        << ",\"dynamicOffset\":" << dump.dynamicOffset
+        << ",\"stride\":" << dump.stride
+        << ",\"vertexShader\":\"" << dump.vertexShader << "\""
+        << ",\"fragmentShader\":\"" << dump.fragmentShader << "\""
+        << ",\"sourceHandle\":" << uint64_t(dump.sourceHandle)
+        << ",\"sourceOffset\":" << dump.sourceOffset
+        << ",\"sourceLength\":" << dump.sourceLength
+        << ",\"bytes\":" << dump.dataSize
+        << ",\"file\":\"" << (dataWritten ? fileName : "")
+        << "\"}\n";
+    }
+
+    Logger::info(str::format(
+      "WineHuaGeometryCapture: completed frame=", m_winehuaFrameId,
+      " records=", m_winehuaGeometryDumps.size(),
+      " files=", filesWritten,
+      " bytes=", m_winehuaGeometryBytes,
+      " metadata=", metadataPath));
+    m_winehuaGeometryDumps.clear();
+    m_winehuaGeometryStateJson.clear();
+  }
+
+
+  void DxvkContext::winehuaWriteRenderTargetDumps() {
+    const std::string basePath = winehuaRenderTargetDumpPath();
+    const std::string frameName = str::format("frame-", m_winehuaFrameId);
+    const std::string metadataPath = str::format(basePath, "/", frameName, ".jsonl");
+    std::ofstream metadata(
+      str::tows(metadataPath.c_str()).c_str(),
+      std::ios_base::binary | std::ios_base::trunc);
+
+    if (!metadata) {
+      Logger::err(str::format(
+        "WineHuaRenderTargetDump: cannot open metadata path=", metadataPath));
+      m_winehuaRenderTargetDumps.clear();
+      return;
+    }
+
+    uint32_t filesWritten = 0;
+    for (auto& dump : m_winehuaRenderTargetDumps) {
+      std::string fileName;
+      bool dataWritten = false;
+
+      if (dump.buffer != nullptr && dump.dataSize) {
+        const auto slice = dump.buffer->getSliceHandle();
+        m_device->waitForResource(dump.buffer, DxvkAccess::Write);
+        dump.buffer->invalidateMappedSlice(slice);
+
+        const std::string mipSuffix = dump.kind == "sampled" && dump.baseMip
+          ? str::format("-mip-", dump.baseMip) : std::string();
+        fileName = str::format(
+          frameName, "-pass-", dump.passId,
+          "-", dump.kind, "-", dump.attachmentId, mipSuffix, ".bin");
+        const std::string dataPath = str::format(basePath, "/", fileName);
+        std::ofstream data(
+          str::tows(dataPath.c_str()).c_str(),
+          std::ios_base::binary | std::ios_base::trunc);
+
+        if (data) {
+          data.write(reinterpret_cast<const char*>(slice.mapPtr), dump.dataSize);
+          dataWritten = data.good();
+          if (dataWritten)
+            filesWritten++;
+        }
+
+        if (!dataWritten) {
+          Logger::err(str::format(
+            "WineHuaRenderTargetDump: cannot write data path=", dataPath));
+        }
+      }
+
+      metadata
+        << "{\"frame\":" << dump.frameId
+        << ",\"pass\":" << dump.passId
+        << ",\"attachment\":" << dump.attachmentId
+        << ",\"kind\":\"" << dump.kind << "\""
+        << ",\"colorIndex\":" << dump.colorIndex
+        << ",\"descriptorBinding\":" << dump.descriptorBinding
+        << ",\"resourceSlot\":" << dump.resourceSlot
+        << ",\"viewCookie\":" << dump.viewCookie
+        << ",\"imageHandle\":" << uint64_t(dump.imageHandle)
+        << ",\"imageFormat\":" << uint32_t(dump.imageFormat)
+        << ",\"viewFormat\":" << uint32_t(dump.viewFormat)
+        << ",\"aspect\":" << uint32_t(dump.aspect)
+        << ",\"extent\":[" << dump.extent.width << ','
+                              << dump.extent.height << ','
+                              << dump.extent.depth << ']'
+        << ",\"viewport\":[" << dump.viewport.x << ','
+                                 << dump.viewport.y << ','
+                                 << dump.viewport.width << ','
+                                 << dump.viewport.height << ','
+                                 << dump.viewport.minDepth << ','
+                                 << dump.viewport.maxDepth << ']'
+        << ",\"scissor\":[" << dump.scissor.offset.x << ','
+                                << dump.scissor.offset.y << ','
+                                << dump.scissor.extent.width << ','
+                                << dump.scissor.extent.height << ']'
+        << ",\"baseMip\":" << dump.baseMip
+        << ",\"baseLayer\":" << dump.baseLayer
+        << ",\"layerCount\":" << dump.layerCount
+        << ",\"layout\":" << uint32_t(dump.layout)
+        << ",\"loadLayout\":" << uint32_t(dump.loadLayout)
+        << ",\"loadOp\":" << uint32_t(dump.loadOp)
+        << ",\"storeLayout\":" << uint32_t(dump.storeLayout)
+        << ",\"rowPitch\":" << dump.rowPitch
+        << ",\"slicePitch\":" << dump.slicePitch
+        << ",\"bytes\":" << dump.dataSize
+        << ",\"vertexShader\":\"" << dump.vertexShader << "\""
+        << ",\"fragmentShader\":\"" << dump.fragmentShader << "\""
+        << ",\"resourceViews\":" << dump.resourceViews
+        << ",\"file\":\"" << (dataWritten ? fileName : "") << "\""
+        << "}\n";
+    }
+
+    Logger::info(str::format(
+      "WineHuaRenderTargetDump: completed frame=", m_winehuaFrameId,
+      " records=", m_winehuaRenderTargetDumps.size(),
+      " files=", filesWritten,
+      " metadata=", metadataPath));
+    m_winehuaRenderTargetDumps.clear();
+  }
   
   
   void DxvkContext::beginQuery(const Rc<DxvkGpuQuery>& query) {
@@ -105,6 +1086,18 @@ namespace dxvk {
   
   void DxvkContext::bindRenderTargets(
     const DxvkRenderTargets&    targets) {
+    const auto& oldDepth = m_state.om.renderTargets.depth.view;
+    const auto& newDepth = targets.depth.view;
+    if (winehuaSampleTraceEnabled()
+     && (winehuaTraceDepthView(oldDepth) || winehuaTraceDepthView(newDepth))) {
+      winehuaSampleTrace(str::format(
+        "depth-target-bind oldCookie=", oldDepth != nullptr ? oldDepth->cookie() : 0,
+        " oldImage=0x", std::hex, oldDepth != nullptr ? oldDepth->imageHandle() : VK_NULL_HANDLE,
+        " newCookie=", std::dec, newDepth != nullptr ? newDepth->cookie() : 0,
+        " newImage=0x", std::hex, newDepth != nullptr ? newDepth->imageHandle() : VK_NULL_HANDLE,
+        " newLayout=", std::dec, targets.depth.layout));
+    }
+
     // Set up default render pass ops
     m_state.om.renderTargets = targets;
     
@@ -463,6 +1456,24 @@ namespace dxvk {
     
     if (m_state.om.framebufferInfo.isFullSize(imageView))
       attachmentIndex = m_state.om.framebufferInfo.findAttachment(imageView);
+
+    if (winehuaSampleTraceEnabled() && winehuaTraceDepthView(imageView)) {
+      winehuaSampleTrace(str::format(
+        "depth-clear-request cookie=", imageView->cookie(),
+        " image=0x", std::hex, imageView->imageHandle(),
+        " view=0x", imageView->handle(),
+        " imageFormat=", std::dec, imageView->imageInfo().format,
+        " viewFormat=", imageView->info().format,
+        " aspect=0x", std::hex, clearAspects,
+        " baseMip=", std::dec, imageView->info().minLevel,
+        " mipCount=", imageView->info().numLevels,
+        " baseLayer=", imageView->info().minLayer,
+        " layerCount=", imageView->info().numLayers,
+        " depth=", clearValue.depthStencil.depth,
+        " stencil=", clearValue.depthStencil.stencil,
+        " attachmentIndex=", attachmentIndex,
+        " renderPassBound=", m_flags.test(DxvkContextFlag::GpRenderPassBound) ? 1 : 0));
+    }
 
     if (attachmentIndex < 0) {
       // Suspend works here because we'll end up with one of these scenarios:
@@ -1331,6 +2342,11 @@ namespace dxvk {
           uint32_t x,
           uint32_t y,
           uint32_t z) {
+    winehuaFlowTrace(str::format(
+      "dispatch request x=", x,
+      " y=", y,
+      " z=", z));
+
     if (this->commitComputeState()) {
       this->commitComputeInitBarriers();
 
@@ -1390,10 +2406,138 @@ namespace dxvk {
           uint32_t instanceCount,
           uint32_t firstVertex,
           uint32_t firstInstance) {
+    winehuaFlowTrace(str::format(
+      "draw request vertices=", vertexCount,
+      " instances=", instanceCount));
+
     if (this->commitGraphicsState<false, false>()) {
-      m_cmd->cmdDraw(
-        vertexCount, instanceCount,
-        firstVertex, firstInstance);
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("draw", str::format(
+          "vertexCount=", vertexCount,
+          " instanceCount=", instanceCount,
+          " firstVertex=", firstVertex,
+          " firstInstance=", firstInstance));
+
+      const auto& blend = m_state.gp.state.omBlend[0];
+      bool singleColorTarget = m_state.om.renderTargets.color[0].view != nullptr;
+      for (uint32_t i = 1; i < MaxNumRenderTargets; i++)
+        singleColorTarget &= m_state.om.renderTargets.color[i].view == nullptr;
+
+      const bool emulateDualSource =
+        !m_device->features().core.features.dualSrcBlend
+        && singleColorTarget
+        && m_state.gp.shaders.fs != nullptr
+        && (m_state.gp.shaders.fs->info().outputMask & 0x2u)
+        && !m_state.gp.flags.any(
+          DxvkGraphicsPipelineFlag::HasTransformFeedback,
+          DxvkGraphicsPipelineFlag::HasStorageDescriptors)
+        && !m_state.gp.state.om.enableLogicOp()
+        && !m_state.gp.state.ds.enableDepthTest()
+        && !m_state.gp.state.ds.enableStencilTest()
+        && blend.blendEnable()
+        && blend.srcColorBlendFactor() == VK_BLEND_FACTOR_ONE
+        && blend.dstColorBlendFactor() == VK_BLEND_FACTOR_SRC1_COLOR
+        && blend.colorBlendOp() == VK_BLEND_OP_ADD
+        && blend.srcAlphaBlendFactor() == VK_BLEND_FACTOR_ONE
+        && blend.dstAlphaBlendFactor() == VK_BLEND_FACTOR_SRC1_ALPHA
+        && blend.alphaBlendOp() == VK_BLEND_OP_ADD;
+
+      bool emulated = false;
+      if (unlikely(emulateDualSource)) {
+        const WineHuaDualSrcMode dualSrcMode = winehuaDualSrcMode();
+        const bool runSecondary = dualSrcMode != WineHuaDualSrcMode::PrimaryReplace
+                               && dualSrcMode != WineHuaDualSrcMode::PrimaryAdd;
+        const bool runPrimary = dualSrcMode != WineHuaDualSrcMode::SecondaryReplace
+                             && dualSrcMode != WineHuaDualSrcMode::SecondaryMultiply;
+        const bool replaceSecondary =
+          dualSrcMode == WineHuaDualSrcMode::SecondaryReplace;
+        const bool replacePrimary =
+          dualSrcMode == WineHuaDualSrcMode::PrimaryReplace;
+        const VkColorComponentFlags rgbWriteMask = blend.colorWriteMask()
+          & (VK_COLOR_COMPONENT_R_BIT
+           | VK_COLOR_COMPONENT_G_BIT
+           | VK_COLOR_COMPONENT_B_BIT);
+
+        if (rgbWriteMask) {
+          DxvkGraphicsPipelineStateInfo secondaryState = m_state.gp.state;
+          DxvkGraphicsPipelineStateInfo primaryState = m_state.gp.state;
+
+          secondaryState.ds = DxvkDsInfo(
+            m_state.gp.state.ds.enableDepthTest(),
+            VK_FALSE,
+            m_state.gp.state.ds.enableDepthBoundsTest(),
+            m_state.gp.state.ds.enableStencilTest(),
+            m_state.gp.state.ds.depthCompareOp());
+          secondaryState.omBlend[0] = DxvkOmAttachmentBlend(
+            VK_TRUE,
+            replaceSecondary ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ZERO,
+            replaceSecondary ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_SRC_COLOR,
+            VK_BLEND_OP_ADD,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_FACTOR_ONE,
+            VK_BLEND_OP_ADD,
+            rgbWriteMask);
+          primaryState.omBlend[0] = DxvkOmAttachmentBlend(
+            VK_TRUE,
+            VK_BLEND_FACTOR_ONE,
+            replacePrimary ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE,
+            VK_BLEND_OP_ADD,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_FACTOR_ONE,
+            VK_BLEND_OP_ADD,
+            rgbWriteMask);
+
+          const DxvkRenderPass* renderPass =
+            m_state.om.framebufferInfo.renderPass();
+          const VkPipeline secondaryPipeline = runSecondary
+            ? m_state.gp.pipeline->getPipelineHandle(
+                secondaryState, renderPass, true)
+            : VK_NULL_HANDLE;
+          const VkPipeline primaryPipeline = runPrimary
+            ? m_state.gp.pipeline->getPipelineHandle(
+                primaryState, renderPass, false)
+            : VK_NULL_HANDLE;
+
+          if ((!runSecondary || secondaryPipeline)
+           && (!runPrimary || primaryPipeline)) {
+            static std::atomic<uint32_t> logged { 0 };
+            if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+              Logger::info(str::format(
+                "WineHuaDualSrcEmulation: mode=",
+                winehuaDualSrcModeName(dualSrcMode), " fs=",
+                m_state.gp.shaders.fs->debugName()));
+            }
+
+            if (runSecondary) {
+              m_cmd->cmdBindPipeline(
+                VK_PIPELINE_BIND_POINT_GRAPHICS, secondaryPipeline);
+              m_cmd->cmdDraw(
+                vertexCount, instanceCount,
+                firstVertex, firstInstance);
+            }
+            if (runPrimary) {
+              m_cmd->cmdBindPipeline(
+                VK_PIPELINE_BIND_POINT_GRAPHICS, primaryPipeline);
+              m_cmd->cmdDraw(
+                vertexCount, instanceCount,
+                firstVertex, firstInstance);
+            }
+            emulated = true;
+
+            m_gpActivePipeline = VK_NULL_HANDLE;
+            m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
+          }
+        }
+      }
+
+      if (!emulated) {
+        m_cmd->cmdDraw(
+          vertexCount, instanceCount,
+          firstVertex, firstInstance);
+      }
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(false, vertexCount, firstVertex, 0,
+          instanceCount, firstInstance);
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1406,11 +2550,20 @@ namespace dxvk {
           uint32_t          stride) {
     if (this->commitGraphicsState<false, true>()) {
       auto descriptor = m_state.id.argBuffer.getDescriptor();
+
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("drawIndirect", str::format(
+          "buffer=0x", std::hex, descriptor.buffer.buffer,
+          " offset=", std::dec, descriptor.buffer.offset + offset,
+          " count=", count,
+          " stride=", stride));
       
       m_cmd->cmdDrawIndirect(
         descriptor.buffer.buffer,
         descriptor.buffer.offset + offset,
         count, stride);
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(false, 0, 0, 0, 0, 0);
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1425,6 +2578,15 @@ namespace dxvk {
     if (this->commitGraphicsState<false, true>()) {
       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
+
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("drawIndirectCount", str::format(
+          "argBuffer=0x", std::hex, argDescriptor.buffer.buffer,
+          " argOffset=", std::dec, argDescriptor.buffer.offset + offset,
+          " countBuffer=0x", std::hex, cntDescriptor.buffer.buffer,
+          " countOffset=", std::dec, cntDescriptor.buffer.offset + countOffset,
+          " maxCount=", maxCount,
+          " stride=", stride));
       
       m_cmd->cmdDrawIndirectCount(
         argDescriptor.buffer.buffer,
@@ -1432,6 +2594,8 @@ namespace dxvk {
         cntDescriptor.buffer.buffer,
         cntDescriptor.buffer.offset + countOffset,
         maxCount, stride);
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(false, 0, 0, 0, 0, 0);
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1444,11 +2608,26 @@ namespace dxvk {
           uint32_t firstIndex,
           uint32_t vertexOffset,
           uint32_t firstInstance) {
+    winehuaFlowTrace(str::format(
+      "draw-indexed request indices=", indexCount,
+      " instances=", instanceCount));
+
     if (this->commitGraphicsState<true, false>()) {
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("drawIndexed", str::format(
+          "indexCount=", indexCount,
+          " instanceCount=", instanceCount,
+          " firstIndex=", firstIndex,
+          " vertexOffset=", vertexOffset,
+          " firstInstance=", firstInstance));
       m_cmd->cmdDrawIndexed(
         indexCount, instanceCount,
         firstIndex, vertexOffset,
         firstInstance);
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(
+          true, indexCount, firstIndex, int32_t(vertexOffset),
+          instanceCount, firstInstance);
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1461,11 +2640,20 @@ namespace dxvk {
           uint32_t          stride) {
     if (this->commitGraphicsState<true, true>()) {
       auto descriptor = m_state.id.argBuffer.getDescriptor();
+
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("drawIndexedIndirect", str::format(
+          "buffer=0x", std::hex, descriptor.buffer.buffer,
+          " offset=", std::dec, descriptor.buffer.offset + offset,
+          " count=", count,
+          " stride=", stride));
       
       m_cmd->cmdDrawIndexedIndirect(
         descriptor.buffer.buffer,
         descriptor.buffer.offset + offset,
         count, stride);
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(true, 0, 0, 0, 0, 0);
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1480,6 +2668,15 @@ namespace dxvk {
     if (this->commitGraphicsState<true, true>()) {
       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
+
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("drawIndexedIndirectCount", str::format(
+          "argBuffer=0x", std::hex, argDescriptor.buffer.buffer,
+          " argOffset=", std::dec, argDescriptor.buffer.offset + offset,
+          " countBuffer=0x", std::hex, cntDescriptor.buffer.buffer,
+          " countOffset=", std::dec, cntDescriptor.buffer.offset + countOffset,
+          " maxCount=", maxCount,
+          " stride=", stride));
       
       m_cmd->cmdDrawIndexedIndirectCount(
         argDescriptor.buffer.buffer,
@@ -1487,6 +2684,8 @@ namespace dxvk {
         cntDescriptor.buffer.buffer,
         cntDescriptor.buffer.offset + countOffset,
         maxCount, stride);
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(true, 0, 0, 0, 0, 0);
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1500,11 +2699,20 @@ namespace dxvk {
     if (this->commitGraphicsState<false, false>()) {
       auto physSlice = counterBuffer.getSliceHandle();
 
+      if (unlikely(winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()))
+        this->winehuaTraceDraw("drawIndirectXfb", str::format(
+          "counterBuffer=0x", std::hex, physSlice.handle,
+          " counterOffset=", std::dec, physSlice.offset,
+          " counterBias=", counterBias,
+          " counterDivisor=", counterDivisor));
+
       m_cmd->cmdDrawIndirectVertexCount(1, 0,
         physSlice.handle,
         physSlice.offset,
         counterBias,
         counterDivisor);
+      if (unlikely(winehuaTargetDrawCaptureEnabled()))
+        this->winehuaCaptureTargetDraw(false, 0, 0, 0, 0, 0);
     }
 
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1748,6 +2956,20 @@ namespace dxvk {
     const DxvkBufferSliceHandle&    slice) {
     // Allocate new backing resource
     DxvkBufferSliceHandle prevSlice = buffer->rename(slice);
+    if (winehuaSampleTraceEnabled()
+     && (buffer->info().usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+      winehuaSampleTrace(str::format(
+        "dynamic-cb-invalidate buffer=", buffer.operator->(),
+        " prevHandle=0x", std::hex, prevSlice.handle,
+        " prevOffset=", std::dec, prevSlice.offset,
+        " nextHandle=0x", std::hex, slice.handle,
+        " nextOffset=", std::dec, slice.offset,
+        " words=0x", std::hex,
+        reinterpret_cast<const uint32_t*>(slice.mapPtr)[0], ",0x",
+        reinterpret_cast<const uint32_t*>(slice.mapPtr)[1], ",0x",
+        reinterpret_cast<const uint32_t*>(slice.mapPtr)[2], ",0x",
+        reinterpret_cast<const uint32_t*>(slice.mapPtr)[3]));
+    }
     m_cmd->freeBufferSlice(buffer, prevSlice);
     
     // We also need to update all bindings that the buffer
@@ -1916,6 +3138,18 @@ namespace dxvk {
           VkImageAspectFlags        discardAspects,
           VkImageAspectFlags        clearAspects,
           VkClearValue              clearValue) {
+    if (winehuaSampleTraceEnabled() && winehuaTraceDepthView(imageView)) {
+      winehuaSampleTrace(str::format(
+        "depth-clear-perform cookie=", imageView->cookie(),
+        " image=0x", std::hex, imageView->imageHandle(),
+        " view=0x", imageView->handle(),
+        " clearAspects=0x", clearAspects,
+        " discardAspects=0x", discardAspects,
+        " depth=", std::dec, clearValue.depthStencil.depth,
+        " stencil=", clearValue.depthStencil.stencil,
+        " attachmentIndex=", attachmentIndex));
+    }
+
     DxvkColorAttachmentOps colorOp;
     colorOp.loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
     colorOp.loadLayout    = imageView->imageInfo().layout;
@@ -1970,6 +3204,9 @@ namespace dxvk {
     }
     
     if (attachmentIndex < 0) {
+      if (winehuaSampleTraceEnabled() && winehuaTraceDepthView(imageView))
+        winehuaSampleTrace("depth-clear-mode temporary-render-pass");
+
       if (m_execBarriers.isImageDirty(
           imageView->image(),
           imageView->imageSubresources(),
@@ -2010,6 +3247,9 @@ namespace dxvk {
       this->renderPassBindFramebuffer(makeFramebufferInfo(attachments), ops, 1, &clearValue);
       this->renderPassUnbindFramebuffer();
     } else {
+      if (winehuaSampleTraceEnabled() && winehuaTraceDepthView(imageView))
+        winehuaSampleTrace("depth-clear-mode folded-load-op");
+
       // Perform the operation when starting the next render pass
       if ((clearAspects | discardAspects) & VK_IMAGE_ASPECT_COLOR_BIT) {
         uint32_t colorIndex = m_state.om.framebufferInfo.getColorAttachmentIndex(attachmentIndex);
@@ -2044,6 +3284,15 @@ namespace dxvk {
     const Rc<DxvkImageView>&        imageView,
           VkImageAspectFlags        clearAspects,
           VkClearValue              clearValue) {
+    if (winehuaSampleTraceEnabled() && winehuaTraceDepthView(imageView)) {
+      winehuaSampleTrace(str::format(
+        "depth-clear-defer cookie=", imageView->cookie(),
+        " image=0x", std::hex, imageView->imageHandle(),
+        " clearAspects=0x", clearAspects,
+        " depth=", std::dec, clearValue.depthStencil.depth,
+        " pendingBefore=", m_deferredClears.size()));
+    }
+
     for (auto& entry : m_deferredClears) {
       if (entry.imageView->matchesView(imageView)) {
         entry.imageView = imageView;
@@ -2187,6 +3436,8 @@ namespace dxvk {
     util::packImageData(tmpBuffer->mapPtr(0), data,
       extent3D, formatInfo->elementSize,
       pitchPerRow, pitchPerLayer);
+    if (winehuaFlushDynamicMapped())
+      this->flushMappedBuffer(tmpBuffer, tmpBuffer->getSliceHandle());
     
     copyPackedBufferToDepthStencilImage(
       image, subresources, imageOffset, imageExtent,
@@ -2203,6 +3454,8 @@ namespace dxvk {
     auto stagingSlice = m_staging.alloc(CACHE_LINE_SIZE, bufferSlice.length);
     auto stagingHandle = stagingSlice.getSliceHandle();
     std::memcpy(stagingHandle.mapPtr, data, bufferSlice.length);
+    if (winehuaFlushDynamicMapped())
+      this->flushMappedBuffer(stagingSlice.buffer(), stagingHandle);
 
     VkBufferCopy region;
     region.srcOffset = stagingHandle.offset;
@@ -2960,6 +4213,8 @@ namespace dxvk {
 
         util::packImageData(stagingHandle.mapPtr, layerData,
           blockCount, elementSize, rowPitch, slicePitch);
+        if (winehuaFlushDynamicMapped())
+          this->flushMappedBuffer(stagingSlice.buffer(), stagingHandle);
 
         auto subresource = imageSubresource;
         subresource.aspectMask = aspect;
@@ -3836,6 +5091,25 @@ namespace dxvk {
       this->applyRenderTargetLoadLayouts();
       this->flushClears(true);
 
+      const auto& depthView = m_state.om.renderTargets.depth.view;
+      if (winehuaSampleTraceEnabled() && winehuaTraceDepthView(depthView)) {
+        const int32_t depthIndex = m_state.om.framebufferInfo.findAttachment(depthView);
+        const VkClearDepthStencilValue clearValue = depthIndex >= 0
+          ? m_state.om.clearValues[depthIndex].depthStencil
+          : VkClearDepthStencilValue { 0.0f, 0 };
+        winehuaSampleTrace(str::format(
+          "depth-render-pass-begin cookie=", depthView->cookie(),
+          " image=0x", std::hex, depthView->imageHandle(),
+          " view=0x", depthView->handle(),
+          " layout=", std::dec, m_state.om.renderTargets.depth.layout,
+          " loadLayout=", m_state.om.renderPassOps.depthOps.loadLayout,
+          " loadOpDepth=", m_state.om.renderPassOps.depthOps.loadOpD,
+          " loadOpStencil=", m_state.om.renderPassOps.depthOps.loadOpS,
+          " clearDepth=", clearValue.depth,
+          " clearStencil=", clearValue.stencil,
+          " attachmentIndex=", depthIndex));
+      }
+
       m_flags.set(DxvkContextFlag::GpRenderPassBound);
       m_flags.clr(DxvkContextFlag::GpRenderPassSuspended);
 
@@ -3881,6 +5155,13 @@ namespace dxvk {
 
       m_gfxBarriers.recordCommands(m_cmd);
 
+      if (winehuaRenderTargetDumpEnabled()
+       && m_winehuaFrameId == winehuaRenderTargetDumpFrame()) {
+        this->winehuaCaptureRenderPass(
+          m_state.om.framebufferInfo,
+          m_winehuaActivePassOps);
+      }
+
       this->unbindGraphicsPipeline();
     } else if (!suspend) {
       // We may end a previously suspended render pass
@@ -3917,6 +5198,59 @@ namespace dxvk {
     info.renderArea           = renderArea;
     info.clearValueCount      = clearValueCount;
     info.pClearValues         = clearValues;
+
+    const bool dumpThisPass = winehuaRenderTargetDumpEnabled()
+      && m_winehuaFrameId == winehuaRenderTargetDumpFrame();
+    const bool traceThisPass = winehuaDrawTraceEnabled()
+      && m_winehuaFrameId == winehuaRenderTargetDumpFrame();
+    if (dumpThisPass || traceThisPass) {
+      m_winehuaActivePassId = m_winehuaPassId++;
+      m_winehuaPassDrawId = 0;
+    }
+    if (dumpThisPass) {
+      m_winehuaActivePassOps = ops;
+    }
+
+    if (winehuaSampleTraceEnabled() || dumpThisPass || traceThisPass) {
+      for (uint32_t i = 0; i < framebufferInfo.numAttachments(); i++) {
+        const auto& attachment = framebufferInfo.getAttachment(i);
+        if (attachment.view == nullptr)
+          continue;
+
+        const int32_t colorIndex = framebufferInfo.getColorAttachmentIndex(i);
+        const bool isDepth = colorIndex < 0;
+        const auto& viewInfo = attachment.view->info();
+        const auto& imageInfo = attachment.view->imageInfo();
+
+        const std::string message = str::format(
+          "begin frame=", m_winehuaFrameId,
+          " pass=", m_winehuaActivePassId,
+          " size=", fbSize.width, "x", fbSize.height,
+          " attachment=", i,
+          " kind=", isDepth ? "depth" : "color",
+          " colorIndex=", colorIndex,
+          " viewCookie=", attachment.view->cookie(),
+          " image=0x", std::hex, attachment.view->imageHandle(),
+          " imageFormat=", std::dec, imageInfo.format,
+          " viewFormat=", viewInfo.format,
+          " aspect=0x", std::hex, viewInfo.aspect,
+          " baseMip=", std::dec, viewInfo.minLevel,
+          " mipCount=", viewInfo.numLevels,
+          " baseLayer=", viewInfo.minLayer,
+          " layerCount=", viewInfo.numLayers,
+          " layout=", attachment.layout,
+          " loadLayout=", isDepth ? ops.depthOps.loadLayout : ops.colorOps[colorIndex].loadLayout,
+          " loadOp=", isDepth ? ops.depthOps.loadOpD : ops.colorOps[colorIndex].loadOp,
+          " storeLayout=", isDepth ? ops.depthOps.storeLayout : ops.colorOps[colorIndex].storeLayout);
+
+        if (winehuaSampleTraceEnabled())
+          winehuaRenderPassTrace(message);
+        if (dumpThisPass)
+          Logger::info("WineHuaRenderTargetPass: " + message);
+        if (traceThisPass)
+          Logger::info("WineHuaDrawPass: " + message);
+      }
+    }
     
     m_cmd->cmdBeginRenderPass(&info,
       VK_SUBPASS_CONTENTS_INLINE);
@@ -3934,6 +5268,232 @@ namespace dxvk {
   
   void DxvkContext::renderPassUnbindFramebuffer() {
     m_cmd->cmdEndRenderPass();
+  }
+
+
+  void DxvkContext::winehuaCaptureRenderPass(
+    const DxvkFramebufferInfo&  framebufferInfo,
+    const DxvkRenderPassOps&    ops) {
+    if (m_winehuaActivePassId < winehuaRenderTargetDumpFirstPass())
+      return;
+
+    const std::string resourceViews = m_winehuaLastGraphicsResourceViews;
+
+    const std::string vertexShader = m_state.gp.shaders.vs != nullptr
+      ? m_state.gp.shaders.vs->debugName() : std::string();
+    const std::string fragmentShader = m_state.gp.shaders.fs != nullptr
+      ? m_state.gp.shaders.fs->debugName() : std::string();
+
+    for (uint32_t i = 0; i < framebufferInfo.numAttachments(); i++) {
+      if (m_winehuaRenderTargetDumps.size()
+          >= winehuaRenderTargetDumpMaxAttachments()) {
+        Logger::info(str::format(
+          "WineHuaRenderTargetDump: attachment limit reached frame=",
+          m_winehuaFrameId,
+          " pass=", m_winehuaActivePassId));
+        break;
+      }
+
+      const auto& attachment = framebufferInfo.getAttachment(i);
+      if (attachment.view == nullptr)
+        continue;
+
+      const auto& viewInfo = attachment.view->info();
+      const auto& imageInfo = attachment.view->imageInfo();
+      const int32_t colorIndex = framebufferInfo.getColorAttachmentIndex(i);
+      const bool isDepth = colorIndex < 0;
+
+      WineHuaRenderTargetDump dump;
+      dump.kind = isDepth ? "depth" : "color";
+      dump.frameId = m_winehuaFrameId;
+      dump.passId = m_winehuaActivePassId;
+      dump.attachmentId = i;
+      dump.colorIndex = colorIndex;
+      dump.viewCookie = attachment.view->cookie();
+      dump.imageHandle = attachment.view->imageHandle();
+      dump.imageFormat = imageInfo.format;
+      dump.viewFormat = viewInfo.format;
+      dump.aspect = viewInfo.aspect;
+      dump.layout = attachment.layout;
+      dump.loadLayout = isDepth
+        ? ops.depthOps.loadLayout : ops.colorOps[colorIndex].loadLayout;
+      dump.loadOp = isDepth
+        ? ops.depthOps.loadOpD : ops.colorOps[colorIndex].loadOp;
+      dump.storeLayout = isDepth
+        ? ops.depthOps.storeLayout : ops.colorOps[colorIndex].storeLayout;
+      dump.extent = attachment.view->mipLevelExtent(0);
+      dump.viewport = m_state.vp.viewports[0];
+      dump.scissor = m_state.vp.scissorRects[0];
+      dump.baseMip = viewInfo.minLevel;
+      dump.baseLayer = imageInfo.type == VK_IMAGE_TYPE_3D
+        ? 0u : viewInfo.minLayer;
+      dump.layerCount = imageInfo.type == VK_IMAGE_TYPE_3D
+        ? 1u : std::min(viewInfo.numLayers, 8u);
+      dump.vertexShader = vertexShader;
+      dump.fragmentShader = fragmentShader;
+      dump.resourceViews = resourceViews;
+
+      VkImageAspectFlags copyAspect = viewInfo.aspect;
+      if (copyAspect & VK_IMAGE_ASPECT_COLOR_BIT)
+        copyAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      else if (copyAspect & VK_IMAGE_ASPECT_DEPTH_BIT)
+        copyAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+      else if (copyAspect & VK_IMAGE_ASPECT_STENCIL_BIT)
+        copyAspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+      dump.aspect = copyAspect;
+
+      const auto formatInfo = attachment.view->formatInfo();
+      const auto blockCount = util::computeBlockCount(
+        dump.extent, formatInfo->blockSize);
+      dump.rowPitch = blockCount.width * formatInfo->elementSize;
+      dump.slicePitch = blockCount.height * dump.rowPitch;
+      dump.dataSize = blockCount.depth * dump.slicePitch * dump.layerCount;
+
+      const bool captureSupported = imageInfo.sampleCount == VK_SAMPLE_COUNT_1_BIT
+        && (imageInfo.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        && !formatInfo->flags.test(DxvkFormatFlag::MultiPlane)
+        && dump.extent.width && dump.extent.height && dump.dataSize
+        && m_winehuaDumpBytes + dump.dataSize
+            <= winehuaRenderTargetDumpMaxBytes();
+
+      if (captureSupported) {
+        DxvkBufferCreateInfo bufferInfo;
+        bufferInfo.size = dump.dataSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        dump.buffer = m_device->createBuffer(bufferInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        VkImageSubresourceLayers subresource;
+        subresource.aspectMask = copyAspect;
+        subresource.mipLevel = dump.baseMip;
+        subresource.baseArrayLayer = dump.baseLayer;
+        subresource.layerCount = dump.layerCount;
+
+        this->copyImageToBuffer(
+          dump.buffer, 0, 0, 0,
+          attachment.view->image(), subresource,
+          VkOffset3D { 0, 0, 0 }, dump.extent);
+        m_winehuaDumpBytes += dump.dataSize;
+      } else {
+        Logger::info(str::format(
+          "WineHuaRenderTargetDump: metadata-only frame=", dump.frameId,
+          " pass=", dump.passId,
+          " attachment=", dump.attachmentId,
+          " samples=", imageInfo.sampleCount,
+          " usage=0x", std::hex, imageInfo.usage,
+          " bytes=", std::dec, dump.dataSize));
+      }
+
+      m_winehuaRenderTargetDumps.push_back(std::move(dump));
+    }
+
+    if (!winehuaRenderTargetDumpSampledEnabled())
+      return;
+
+    for (const auto& resource : m_winehuaLastGraphicsImages) {
+      bool duplicate = false;
+      for (const auto& existing : m_winehuaRenderTargetDumps) {
+        duplicate |= existing.passId == m_winehuaActivePassId
+                  && existing.viewCookie == resource.view->cookie();
+      }
+      if (duplicate)
+        continue;
+
+      WineHuaRenderTargetDump dump;
+      dump.kind = "sampled";
+      dump.frameId = m_winehuaFrameId;
+      dump.passId = m_winehuaActivePassId;
+      dump.attachmentId = resource.binding;
+      dump.colorIndex = -2;
+      dump.descriptorBinding = resource.binding;
+      dump.resourceSlot = resource.resourceSlot;
+      dump.layout = resource.view->imageInfo().layout;
+      dump.viewport = m_state.vp.viewports[0];
+      dump.scissor = m_state.vp.scissorRects[0];
+      dump.vertexShader = vertexShader;
+      dump.fragmentShader = fragmentShader;
+      dump.resourceViews = resourceViews;
+      this->winehuaCaptureImageView(std::move(dump), resource.view);
+    }
+  }
+
+
+  void DxvkContext::winehuaCaptureImageView(
+          WineHuaRenderTargetDump dump,
+    const Rc<DxvkImageView>&      view) {
+    const auto& viewInfo = view->info();
+    const auto& imageInfo = view->imageInfo();
+    dump.viewCookie = view->cookie();
+    dump.imageHandle = view->imageHandle();
+    dump.imageFormat = imageInfo.format;
+    dump.viewFormat = viewInfo.format;
+    dump.baseLayer = imageInfo.type == VK_IMAGE_TYPE_3D
+      ? 0u : viewInfo.minLayer;
+    dump.layerCount = imageInfo.type == VK_IMAGE_TYPE_3D
+      ? 1u : std::min(viewInfo.numLayers, 8u);
+
+    VkImageAspectFlags copyAspect = viewInfo.aspect;
+    if (copyAspect & VK_IMAGE_ASPECT_COLOR_BIT)
+      copyAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    else if (copyAspect & VK_IMAGE_ASPECT_DEPTH_BIT)
+      copyAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    else if (copyAspect & VK_IMAGE_ASPECT_STENCIL_BIT)
+      copyAspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+    dump.aspect = copyAspect;
+
+    const auto formatInfo = view->formatInfo();
+    for (uint32_t mip = 0; mip < viewInfo.numLevels; mip++) {
+      if (m_winehuaRenderTargetDumps.size()
+          >= winehuaRenderTargetDumpMaxAttachments())
+        break;
+
+      WineHuaRenderTargetDump mipDump = dump;
+      mipDump.extent = view->mipLevelExtent(mip);
+      mipDump.baseMip = viewInfo.minLevel + mip;
+
+      const auto blockCount = util::computeBlockCount(
+        mipDump.extent, formatInfo->blockSize);
+      mipDump.rowPitch = blockCount.width * formatInfo->elementSize;
+      mipDump.slicePitch = blockCount.height * mipDump.rowPitch;
+      mipDump.dataSize = blockCount.depth * mipDump.slicePitch * mipDump.layerCount;
+
+      const bool captureSupported = imageInfo.sampleCount == VK_SAMPLE_COUNT_1_BIT
+        && (imageInfo.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        && !formatInfo->flags.test(DxvkFormatFlag::MultiPlane)
+        && mipDump.extent.width && mipDump.extent.height && mipDump.dataSize
+        && m_winehuaDumpBytes + mipDump.dataSize
+            <= winehuaRenderTargetDumpMaxBytes();
+
+      if (captureSupported) {
+        DxvkBufferCreateInfo bufferInfo;
+        bufferInfo.size = mipDump.dataSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        mipDump.buffer = m_device->createBuffer(bufferInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        VkImageSubresourceLayers subresource;
+        subresource.aspectMask = copyAspect;
+        subresource.mipLevel = mipDump.baseMip;
+        subresource.baseArrayLayer = mipDump.baseLayer;
+        subresource.layerCount = mipDump.layerCount;
+
+        this->copyImageToBuffer(
+          mipDump.buffer, 0, 0, 0,
+          view->image(), subresource,
+          VkOffset3D { 0, 0, 0 }, mipDump.extent);
+        m_winehuaDumpBytes += mipDump.dataSize;
+      }
+
+      m_winehuaRenderTargetDumps.push_back(std::move(mipDump));
+    }
   }
   
   
@@ -4218,6 +5778,32 @@ namespace dxvk {
             descriptors[i].image.sampler     = VK_NULL_HANDLE;
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
             descriptors[i].image.imageLayout = res.imageView->imageInfo().layout;
+
+            if (winehuaSampleTraceEnabled()
+             && (winehuaTraceDepthView(res.imageView)
+              || (res.imageView->imageInfo().format == VK_FORMAT_R8G8B8A8_UNORM
+               && res.imageView->imageInfo().extent.width <= 16
+               && res.imageView->imageInfo().extent.height <= 16))) {
+              winehuaSampleTrace(str::format(
+                "descriptor sampled set=0 binding=", i,
+                " resourceSlot=", binding.slot,
+                " viewType=", binding.view,
+                " viewCookie=", res.imageView->cookie(),
+                " imageView=0x", std::hex, descriptors[i].image.imageView,
+                " image=0x", res.imageView->imageHandle(),
+                " imageFormat=", std::dec, res.imageView->imageInfo().format,
+                " viewFormat=", res.imageView->info().format,
+                " aspect=0x", std::hex, res.imageView->info().aspect,
+                " baseMip=", std::dec, res.imageView->info().minLevel,
+                " mipCount=", res.imageView->info().numLevels,
+                " baseLayer=", res.imageView->info().minLayer,
+                " layerCount=", res.imageView->info().numLayers,
+                " sampler=0x", descriptors[i].image.sampler,
+                " layout=", descriptors[i].image.imageLayout,
+                " descriptorType=", binding.type,
+                " shaderStages=0x", binding.stages,
+                " imageUsage=0x", res.imageView->imageInfo().usage));
+            }
             
             if (m_rcTracked.set(binding.slot)) {
               m_cmd->trackResource<DxvkAccess::None>(res.imageView);
@@ -4244,21 +5830,82 @@ namespace dxvk {
           } break;
         
         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-          if (res.sampler != nullptr && res.imageView != nullptr
-           && res.imageView->handle(binding.view) != VK_NULL_HANDLE) {
-            descriptors[i].image.sampler     = res.sampler->handle();
+          {
+            /* WineHua's opt-in DXBC compatibility mode declares the
+             * combined descriptor at the SRV binding while the D3D11 API
+             * still stores the sampler at its normal s# binding. Pair those
+             * slots here. Existing users that bind both objects to one slot
+             * continue to take the fast path. */
+            const DxvkShaderResourceSlot* samplerRes = &res;
+            const uint32_t stageSlot = binding.slot % DxbcStageBindingCount;
+            const bool splitD3d11Binding =
+              res.sampler == nullptr && stageSlot >= DxbcResourceBindingIndex &&
+              stageSlot < DxbcResourceBindingIndex + DxbcResourceBindingCount;
+            const uint32_t samplerSlot = splitD3d11Binding
+              ? binding.slot - (DxbcResourceBindingIndex - DxbcSamplerBindingIndex)
+              : binding.slot;
+            if (splitD3d11Binding)
+              samplerRes = &m_rc[samplerSlot];
+
+          const bool imageReady = res.imageView != nullptr
+            && res.imageView->handle(binding.view) != VK_NULL_HANDLE;
+          const bool samplerReady = samplerRes->sampler != nullptr;
+          /* Texture2D.Load has no s# operand, but combined descriptors still
+           * require a VkSampler handle.  Use the immutable DXVK dummy sampler
+           * when the D3D11 SRV is present and the binding is the WineHua
+           * split SRV/sampler form.  OpImageFetch ignores the sampler; this
+           * keeps the descriptor bound and lets the shader's image-only Load
+           * path remain valid without inventing a sampler in DXBC. */
+          if (imageReady && (samplerReady || splitD3d11Binding)) {
+            const VkDescriptorImageInfo dummy =
+              m_common->dummyResources().imageSamplerDescriptor(binding.view);
+            descriptors[i].image.sampler     = samplerReady
+              ? samplerRes->sampler->handle() : dummy.sampler;
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
             descriptors[i].image.imageLayout = res.imageView->imageInfo().layout;
+
+            if (winehuaSampleTraceEnabled()
+             && (winehuaTraceDepthView(res.imageView)
+              || (res.imageView->imageInfo().format == VK_FORMAT_R8G8B8A8_UNORM
+               && res.imageView->imageInfo().extent.width <= 16
+               && res.imageView->imageInfo().extent.height <= 16))) {
+              winehuaSampleTrace(str::format(
+                "descriptor combined set=0 binding=", i,
+                " resourceSlot=", binding.slot,
+                " samplerSlot=", samplerSlot,
+                " viewType=", binding.view,
+                " viewCookie=", res.imageView->cookie(),
+                " imageView=0x", std::hex, descriptors[i].image.imageView,
+                " image=0x", res.imageView->imageHandle(),
+                " imageFormat=", std::dec, res.imageView->imageInfo().format,
+                " viewFormat=", res.imageView->info().format,
+                " aspect=0x", std::hex, res.imageView->info().aspect,
+                " baseMip=", std::dec, res.imageView->info().minLevel,
+                " mipCount=", res.imageView->info().numLevels,
+                " baseLayer=", res.imageView->info().minLayer,
+                " layerCount=", res.imageView->info().numLayers,
+                " sampler=0x", descriptors[i].image.sampler,
+                " layout=", descriptors[i].image.imageLayout,
+                " descriptorType=", binding.type,
+                " shaderStages=0x", binding.stages,
+                " imageUsage=0x", res.imageView->imageInfo().usage,
+                " split=", splitD3d11Binding ? 1 : 0,
+                " dummySampler=", samplerReady ? 0 : 1));
+            }
             
             if (m_rcTracked.set(binding.slot)) {
-              m_cmd->trackResource<DxvkAccess::None>(res.sampler);
+              if (samplerReady)
+                m_cmd->trackResource<DxvkAccess::None>(samplerRes->sampler);
               m_cmd->trackResource<DxvkAccess::None>(res.imageView);
               m_cmd->trackResource<DxvkAccess::Read>(res.imageView->image());
             }
+            if (splitD3d11Binding && samplerReady && m_rcTracked.set(samplerSlot))
+              m_cmd->trackResource<DxvkAccess::None>(samplerRes->sampler);
           } else {
             bindMask.clr(i);
             descriptors[i].image = m_common->dummyResources().imageSamplerDescriptor(binding.view);
           } break;
+          }
         
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
           if (res.bufferView != nullptr) {
@@ -4313,6 +5960,11 @@ namespace dxvk {
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
           if (res.bufferSlice.defined()) {
             descriptors[i] = res.bufferSlice.getDescriptor();
+            winehuaSampleTrace(str::format(
+              "dynamic-cb-descriptor slot=", binding.slot,
+              " handle=0x", std::hex, descriptors[i].buffer.buffer,
+              " physicalOffset=", std::dec, descriptors[i].buffer.offset,
+              " range=", descriptors[i].buffer.range));
             descriptors[i].buffer.offset = 0;
             
             if (m_rcTracked.set(binding.slot))
@@ -4333,10 +5985,143 @@ namespace dxvk {
     if (layout->bindingCount()) {
       set = allocateDescriptorSet(layout->descriptorSetLayout());
 
+      if (winehuaSampleTraceEnabled()) {
+        for (uint32_t i = 0; i < layout->bindingCount(); i++) {
+          const auto& binding = layout->binding(i);
+          if (binding.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+           || binding.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+           || binding.type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+            winehuaSampleTrace(str::format(
+              "descriptor-template-write bindPoint=", BindPoint,
+              " set=0 binding=", i,
+              " resourceSlot=", binding.slot,
+              " descriptorSet=0x", std::hex, set,
+              " updateTemplate=0x", layout->descriptorTemplate(),
+              " descriptorType=", binding.type,
+              " shaderStages=0x", binding.stages,
+              " imageView=0x", descriptors[i].image.imageView,
+              " sampler=0x", descriptors[i].image.sampler,
+              " layout=", descriptors[i].image.imageLayout));
+          }
+        }
+      }
+
       m_cmd->updateDescriptorSetWithTemplate(set,
         layout->descriptorTemplate(), descriptors.data());
     } else {
       set = VK_NULL_HANDLE;
+    }
+
+    if constexpr (BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+      if (winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()) {
+        m_winehuaDescriptorUpdateSerial++;
+        m_winehuaGraphicsBindings.clear();
+        m_winehuaGraphicsBindings.reserve(layout->bindingCount());
+
+        for (uint32_t i = 0; i < layout->bindingCount(); i++) {
+          const auto& descriptorBinding = layout->binding(i);
+          const auto& resource = m_rc[descriptorBinding.slot];
+
+          WineHuaGraphicsBindingTrace trace;
+          trace.binding = i;
+          trace.resourceSlot = descriptorBinding.slot;
+          trace.descriptorType = descriptorBinding.type;
+          trace.viewType = descriptorBinding.view;
+          trace.stages = descriptorBinding.stages;
+
+          switch (descriptorBinding.type) {
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+              trace.image = descriptors[i].image;
+              trace.sampler = resource.sampler;
+              break;
+
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+              trace.image = descriptors[i].image;
+              trace.imageView = resource.imageView;
+              break;
+
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+              trace.image = descriptors[i].image;
+              trace.imageView = resource.imageView;
+
+              const uint32_t stageSlot = descriptorBinding.slot % DxbcStageBindingCount;
+              const bool splitD3d11Binding = resource.sampler == nullptr
+                && stageSlot >= DxbcResourceBindingIndex
+                && stageSlot < DxbcResourceBindingIndex + DxbcResourceBindingCount;
+              const uint32_t samplerSlot = splitD3d11Binding
+                ? descriptorBinding.slot
+                    - (DxbcResourceBindingIndex - DxbcSamplerBindingIndex)
+                : descriptorBinding.slot;
+              trace.sampler = m_rc[samplerSlot].sampler;
+            } break;
+
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+              trace.buffer = descriptors[i].buffer;
+              trace.bufferSlice = resource.bufferSlice;
+              break;
+
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+              trace.texelBuffer = descriptors[i].texelBuffer;
+              break;
+
+            default:
+              break;
+          }
+
+          m_winehuaGraphicsBindings.push_back(std::move(trace));
+        }
+
+        if (m_winehuaFrameId == winehuaRenderTargetDumpFrame()) {
+          Logger::info(str::format(
+            "WineHuaDrawDescriptor: event=update frame=", m_winehuaFrameId,
+            " pass=", m_winehuaActivePassId,
+            " serial=", m_winehuaDescriptorUpdateSerial,
+            " descriptorSet=0x", std::hex, set,
+            " bindingCount=", std::dec, layout->bindingCount()));
+        }
+      }
+    }
+
+    if constexpr (BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+      if (winehuaRenderTargetDumpEnabled()
+       && m_winehuaFrameId == winehuaRenderTargetDumpFrame()) {
+        std::string resourceViews = "[";
+        bool firstResource = true;
+        m_winehuaLastGraphicsImages.clear();
+        for (uint32_t i = 0; i < layout->bindingCount(); i++) {
+          const auto& binding = layout->binding(i);
+          const auto& view = m_rc[binding.slot].imageView;
+          if (view == nullptr)
+            continue;
+
+          m_winehuaLastGraphicsImages.push_back(WineHuaGraphicsResourceDump {
+            i, binding.slot, binding.type, view });
+
+          if (!firstResource)
+            resourceViews += ',';
+          resourceViews += str::format(
+            "{\"binding\":", i,
+            ",\"resourceSlot\":", binding.slot,
+            ",\"descriptorType\":", uint32_t(binding.type),
+            ",\"descriptorImageView\":", uint64_t(descriptors[i].image.imageView),
+            ",\"descriptorSampler\":", uint64_t(descriptors[i].image.sampler),
+            ",\"viewCookie\":", view->cookie(),
+            ",\"imageHandle\":", uint64_t(view->imageHandle()),
+            ",\"viewFormat\":", uint32_t(view->info().format),
+            ",\"aspect\":", uint32_t(view->info().aspect),
+            ",\"baseMip\":", view->info().minLevel,
+            ",\"baseLayer\":", view->info().minLayer,
+            ",\"layerCount\":", view->info().numLayers,
+            '}');
+          firstResource = false;
+        }
+        resourceViews += ']';
+        m_winehuaLastGraphicsResourceViews = std::move(resourceViews);
+      }
     }
 
     // Select the active binding mask to update
@@ -4363,6 +6148,14 @@ namespace dxvk {
     if (set) {
       std::array<uint32_t, MaxNumActiveBindings> offsets;
 
+      if (winehuaSampleTraceEnabled()) {
+        winehuaSampleTrace(str::format(
+          "descriptor-bind bindPoint=", BindPoint,
+          " set=0 descriptorSet=0x", std::hex, set,
+          " pipelineLayout=0x", layout->pipelineLayout(),
+          " dynamicBindingCount=", std::dec, layout->dynamicBindingCount()));
+      }
+
       for (uint32_t i = 0; i < layout->dynamicBindingCount(); i++) {
         const auto& binding = layout->dynamicBinding(i);
         const auto& res     = m_rc[binding.slot];
@@ -4370,6 +6163,38 @@ namespace dxvk {
         offsets[i] = res.bufferSlice.defined()
           ? res.bufferSlice.getDynamicOffset()
           : 0;
+
+        if constexpr (BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+          if (winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()) {
+            for (auto& trace : m_winehuaGraphicsBindings) {
+              if (trace.resourceSlot == binding.slot
+               && trace.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+                trace.dynamicOffset = offsets[i];
+                trace.dynamicOffsetBound = true;
+                trace.bufferSlice = res.bufferSlice;
+                break;
+              }
+            }
+          }
+        }
+        winehuaSampleTrace(str::format(
+          "dynamic-cb-bind index=", i,
+          " slot=", binding.slot,
+          " dynamicOffset=", offsets[i]));
+      }
+
+      if constexpr (BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        if (winehuaDrawTraceEnabled() || winehuaCameraTraceEnabled()) {
+          m_winehuaDescriptorBindSerial++;
+          if (m_winehuaFrameId == winehuaRenderTargetDumpFrame()) {
+            Logger::info(str::format(
+              "WineHuaDrawDescriptor: event=bind frame=", m_winehuaFrameId,
+              " pass=", m_winehuaActivePassId,
+              " serial=", m_winehuaDescriptorBindSerial,
+              " descriptorSet=0x", std::hex, set,
+              " dynamicBindingCount=", std::dec, layout->dynamicBindingCount()));
+          }
+        }
       }
       
       m_cmd->cmdBindDescriptorSet(BindPoint,

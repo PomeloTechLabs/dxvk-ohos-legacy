@@ -21,6 +21,7 @@ namespace dxvk {
 
     DXGI_VK_FORMAT_INFO formatInfo = pDevice->LookupFormat(
       pDesc->Format, DXGI_VK_FORMAT_MODE_COLOR);
+    formatInfo.Format = texture->GetViewFormat(pDesc->Format);
 
     DxvkImageViewCreateInfo viewInfo;
     viewInfo.format  = formatInfo.Format;

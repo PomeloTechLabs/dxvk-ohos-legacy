@@ -68,8 +68,13 @@ namespace dxvk {
                     | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
                     | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                     | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
-                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
-                    | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+
+    // DXVK's desktop feature contract normally guarantees transform feedback.
+    // Native OHOS may negotiate it off, in which case its extension-only
+    // buffer-usage bit must not reach vkCreateBuffer.
+    if (dev->features().extTransformFeedback.transformFeedback)
+      info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
     info.stages     = VK_PIPELINE_STAGE_TRANSFER_BIT
                     | dev->getShaderPipelineStages();
     info.access     = VK_ACCESS_UNIFORM_READ_BIT

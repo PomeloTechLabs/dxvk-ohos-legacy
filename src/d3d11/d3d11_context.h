@@ -5,6 +5,8 @@
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_staging.h"
 
+#include "../util/sha1/sha1_util.h"
+
 #include "../d3d10/d3d10_multithread.h"
 
 #include "d3d11_annotation.h"
@@ -708,6 +710,41 @@ namespace dxvk {
     
     D3D11ContextState           m_state;
     D3D11CmdData*               m_cmdData;
+
+    using SamplerEmulationStageData = std::array<
+      D3D11SamplerEmulationData,
+      D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT>;
+
+    bool m_samplerEmulationEnabled = false;
+    std::array<Rc<DxvkBuffer>, 6> m_samplerEmulationBuffers;
+    std::array<SamplerEmulationStageData, 6> m_samplerEmulationData;
+
+    bool m_instanceDivisorEmulationLogged = false;
+    bool m_instanceDivisorFailureLogged = false;
+
+    struct InstanceDivisorCacheEntry {
+      Com<D3D11Buffer>      sourceBuffer;
+      DxvkBufferSliceHandle sourceSlice = { };
+      UINT                  sourceOffset = 0;
+      UINT                  sourceStride = 0;
+      UINT                  divisor = 0;
+      UINT                  startInstance = 0;
+      UINT                  instanceCount = 0;
+      Sha1Hash              sourceHash;
+      Rc<DxvkBuffer>        expandedBuffer;
+      bool                  valid = false;
+    };
+
+    std::array<InstanceDivisorCacheEntry,
+      D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> m_instanceDivisorCache;
+
+    bool TryEmitInstanceDivisorDraw(
+            bool                              Indexed,
+            UINT                              ElementCount,
+            UINT                              InstanceCount,
+            UINT                              StartElementLocation,
+            INT                               BaseVertexLocation,
+            UINT                              StartInstanceLocation);
     
     void ApplyInputLayout();
     
@@ -728,6 +765,9 @@ namespace dxvk {
     template<DxbcProgramType ShaderStage>
     void BindShader(
       const D3D11CommonShader*                pShaderModule);
+
+    template<DxbcProgramType ShaderStage>
+    void UpdateSamplerEmulationBuffer();
     
     void BindFramebuffer();
     

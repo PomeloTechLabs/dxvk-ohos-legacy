@@ -1,7 +1,30 @@
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <functional>
+#include <limits>
+#if defined(DXVK_NATIVE_OHOS)
+#include <unistd.h>
+#define _getpid getpid
+#else
+#include <process.h>
+#endif
+
 namespace dxvk {
+
+  static std::atomic<uint64_t> g_winehuaRecordingId = { 0 };
+  static std::atomic<bool> g_winehuaMappedFlushBatchLogged = { false };
+  static std::atomic<uint64_t> g_winehuaMappedFlushLists = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushQueuedRanges = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushEmittedRanges = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushCalls = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushQueuedBytes = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushEmittedBytes = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushWholeRanges = { 0 };
+  static std::atomic<uint64_t> g_winehuaMappedFlushFailures = { 0 };
     
   DxvkCommandList::DxvkCommandList(DxvkDevice* device)
   : m_device        (device),
@@ -85,6 +108,10 @@ namespace dxvk {
     const auto& graphics = m_device->queues().graphics;
     const auto& transfer = m_device->queues().transfer;
 
+    const VkResult mappedFlushResult = flushWineHuaMappedFlushes();
+    if (mappedFlushResult != VK_SUCCESS)
+      return mappedFlushResult;
+
     m_submission.reset();
 
     if (m_cmdBuffersUsed.test(DxvkCmdBuffer::SdmaBuffer)) {
@@ -106,6 +133,37 @@ namespace dxvk {
       m_submission.cmdBuffers.push_back(m_initBuffer);
     if (m_cmdBuffersUsed.test(DxvkCmdBuffer::ExecBuffer))
       m_submission.cmdBuffers.push_back(m_execBuffer);
+
+    if (winehuaCameraTraceEnabled() && !m_winehuaFrames.empty()) {
+      std::string frames = "[";
+      for (size_t i = 0; i < m_winehuaFrames.size(); i++) {
+        if (i)
+          frames += ',';
+        frames += str::format(m_winehuaFrames[i]);
+      }
+      frames += ']';
+
+      Logger::info(str::format(
+        "WineHuaDxvkSubmit: winPid=", _getpid(),
+        " recording=", m_winehuaRecordingId,
+        " execCmd=0x", std::hex, reinterpret_cast<uintptr_t>(m_execBuffer),
+        " frameCount=", std::dec, m_winehuaFrames.size(),
+        " frames=", frames));
+    }
+
+    if (winehuaPresentImageTraceEnabled() && m_winehuaPresentCopyValid) {
+      Logger::info(str::format(
+        "WineHuaPresentCopy: layer=dxvk event=submit",
+        " frame=", m_winehuaPresentCopyFrame,
+        " recording=", m_winehuaRecordingId,
+        " execCmd=0x", std::hex,
+          reinterpret_cast<uintptr_t>(m_execBuffer),
+        " sourceImage=0x", m_winehuaPresentCopySourceImage,
+        " destinationImage=0x", m_winehuaPresentCopyDestinationImage,
+        " destinationIndex=", std::dec,
+          m_winehuaPresentCopyDestinationIndex,
+        " sourceSamples=", uint32_t(m_winehuaPresentCopySourceSamples)));
+    }
     
     if (waitSemaphore)
       m_submission.addWaitSemaphore(waitSemaphore, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -122,6 +180,153 @@ namespace dxvk {
     }
 
     return submitToQueue(graphics.queueHandle, m_fence, m_submission);
+  }
+
+
+  VkResult DxvkCommandList::queueWineHuaMappedFlush(
+          Rc<DxvkResource>          resource,
+    const VkMappedMemoryRange&      range) {
+    if (!g_winehuaMappedFlushBatchLogged.exchange(true))
+      Logger::info("WineHua: command-list-owned mapped flush batching enabled");
+
+    WineHuaMappedFlush pending;
+    pending.resource = std::move(resource);
+    pending.range = range;
+    pending.range.pNext = nullptr;
+    m_winehuaMappedFlushes.push_back(std::move(pending));
+    return VK_SUCCESS;
+  }
+
+
+  VkResult DxvkCommandList::flushWineHuaMappedFlushes() {
+    if (m_winehuaMappedFlushes.empty())
+      return VK_SUCCESS;
+
+    const bool collectStats = winehuaBatchMappedFlushStats();
+    const uint64_t queuedRangeCount = m_winehuaMappedFlushes.size();
+    uint64_t emittedRangeCount = 0;
+    uint64_t flushCallCount = 0;
+    uint64_t queuedBytes = 0;
+    uint64_t emittedBytes = 0;
+    uint64_t wholeRangeCount = 0;
+
+    const auto memoryLess = [] (VkDeviceMemory a, VkDeviceMemory b) {
+      return std::less<VkDeviceMemory>()(a, b);
+    };
+
+    std::sort(m_winehuaMappedFlushes.begin(), m_winehuaMappedFlushes.end(),
+      [&memoryLess] (const WineHuaMappedFlush& a,
+                     const WineHuaMappedFlush& b) {
+        if (memoryLess(a.range.memory, b.range.memory))
+          return true;
+        if (memoryLess(b.range.memory, a.range.memory))
+          return false;
+        return a.range.offset < b.range.offset;
+      });
+
+    const auto rangeEnd = [] (const VkMappedMemoryRange& range) {
+      if (range.size == VK_WHOLE_SIZE
+       || range.size > std::numeric_limits<VkDeviceSize>::max() - range.offset)
+        return std::numeric_limits<VkDeviceSize>::max();
+      return range.offset + range.size;
+    };
+
+    constexpr uint32_t MaxRangesPerCall = 256;
+    std::array<VkMappedMemoryRange, MaxRangesPerCall> ranges;
+    uint32_t rangeCount = 0;
+
+    const auto flushRanges = [&] () {
+      if (!rangeCount)
+        return VK_SUCCESS;
+
+      if (collectStats) {
+        emittedRangeCount += rangeCount;
+        flushCallCount += 1;
+        for (uint32_t i = 0; i < rangeCount; i++) {
+          if (ranges[i].size == VK_WHOLE_SIZE)
+            wholeRangeCount += 1;
+          else
+            emittedBytes += ranges[i].size;
+        }
+      }
+
+      const VkResult result = m_vkd->vkFlushMappedMemoryRanges(
+        m_vkd->device(), rangeCount, ranges.data());
+      rangeCount = 0;
+      return result;
+    };
+
+    for (const auto& entry : m_winehuaMappedFlushes) {
+      const auto& range = entry.range;
+      if (!range.size)
+        continue;
+
+      if (collectStats && range.size != VK_WHOLE_SIZE)
+        queuedBytes += range.size;
+
+      if (rangeCount) {
+        auto& previous = ranges[rangeCount - 1];
+        const bool sameMemory = !memoryLess(previous.memory, range.memory)
+                             && !memoryLess(range.memory, previous.memory);
+        const VkDeviceSize previousEnd = rangeEnd(previous);
+        if (sameMemory && range.offset <= previousEnd) {
+          const VkDeviceSize mergedEnd = std::max(previousEnd, rangeEnd(range));
+          previous.size = mergedEnd == std::numeric_limits<VkDeviceSize>::max()
+            ? VK_WHOLE_SIZE
+            : mergedEnd - previous.offset;
+          continue;
+        }
+      }
+
+      if (rangeCount == MaxRangesPerCall) {
+        const VkResult result = flushRanges();
+        if (result != VK_SUCCESS) {
+          if (collectStats)
+            g_winehuaMappedFlushFailures.fetch_add(1);
+          return result;
+        }
+      }
+
+      ranges[rangeCount++] = range;
+    }
+
+    const VkResult result = flushRanges();
+    if (collectStats) {
+      if (result != VK_SUCCESS)
+        g_winehuaMappedFlushFailures.fetch_add(1);
+
+      const uint64_t lists =
+        g_winehuaMappedFlushLists.fetch_add(1) + 1;
+      const uint64_t queuedRanges =
+        g_winehuaMappedFlushQueuedRanges.fetch_add(queuedRangeCount) +
+        queuedRangeCount;
+      const uint64_t emittedRanges =
+        g_winehuaMappedFlushEmittedRanges.fetch_add(emittedRangeCount) +
+        emittedRangeCount;
+      const uint64_t calls =
+        g_winehuaMappedFlushCalls.fetch_add(flushCallCount) + flushCallCount;
+      const uint64_t totalQueuedBytes =
+        g_winehuaMappedFlushQueuedBytes.fetch_add(queuedBytes) + queuedBytes;
+      const uint64_t totalEmittedBytes =
+        g_winehuaMappedFlushEmittedBytes.fetch_add(emittedBytes) + emittedBytes;
+      const uint64_t wholeRanges =
+        g_winehuaMappedFlushWholeRanges.fetch_add(wholeRangeCount) +
+        wholeRangeCount;
+
+      if (lists <= 8 || !(lists % 120)) {
+        Logger::info(str::format(
+          "WineHuaMappedFlushPerf: lists=", lists,
+          " queued_ranges=", queuedRanges,
+          " emitted_ranges=", emittedRanges,
+          " calls=", calls,
+          " queued_bytes=", totalQueuedBytes,
+          " emitted_bytes=", totalEmittedBytes,
+          " whole_ranges=", wholeRanges,
+          " failures=", g_winehuaMappedFlushFailures.load()));
+      }
+    }
+
+    return result;
   }
   
   
@@ -160,6 +365,13 @@ namespace dxvk {
     // Unconditionally mark the exec buffer as used. There
     // is virtually no use case where this isn't correct.
     m_cmdBuffersUsed = DxvkCmdBuffer::ExecBuffer;
+
+    m_winehuaFrames.clear();
+    m_winehuaPresentCopyValid = false;
+    m_winehuaRecordingId = (winehuaCameraTraceEnabled()
+                          || winehuaPresentImageTraceEnabled())
+      ? g_winehuaRecordingId.fetch_add(1, std::memory_order_relaxed) + 1
+      : 0;
   }
   
   
@@ -189,6 +401,8 @@ namespace dxvk {
     // Less important stuff
     m_signalTracker.reset();
     m_statCounters.reset();
+
+    m_winehuaMappedFlushes.clear();
 
     m_waitSemaphores.clear();
     m_signalSemaphores.clear();

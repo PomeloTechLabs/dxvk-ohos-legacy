@@ -60,6 +60,25 @@ namespace dxvk {
     /// Replace ld_ms with ld
     bool disableMsaa = false;
 
+    /// Use combined image samplers for the WineHua sampled-image probe.
+    /// This is intentionally opt-in until separated sampled-image reads are
+    /// verified on the target Venus/Host driver.
+    bool useCombinedImageSampler = false;
+
+    /// Correct arbitrary D3D11 border colors in generated shaders when the
+    /// active Vulkan device cannot provide format-independent custom colors.
+    bool emulateCustomBorderColor = false;
+
+    /// Pad non-array Cube comparison coordinates with the Dref value.  Both
+    /// vec3 and vec4 forms are valid SPIR-V, but the Maleoon fragment compiler
+    /// miscompiles OpImageSampleDref* with the minimal vec3 form.
+    bool padCubeDrefCoordinates = false;
+
+    /// Replace CubeArray sampling with an equivalent 2D-array view and
+    /// shader-side face selection for resources used by comparison sampling.
+    /// Maleoon otherwise hangs the Host Venus ring on CubeArray Dref.
+    bool emulateCubeArrayDref = false;
+
     /// Float control flags
     DxbcFloatControlFlags floatControl;
 

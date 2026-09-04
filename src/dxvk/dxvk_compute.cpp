@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cstdlib>
 
 #include "../util/util_time.h"
 
@@ -7,6 +8,7 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
+#include "dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -82,6 +84,7 @@ namespace dxvk {
   VkPipeline DxvkComputePipeline::createPipeline(
     const DxvkComputePipelineStateInfo& state) const {
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    winehuaFlowTrace("compute-pipeline begin");
 
     if (Logger::logLevel() <= LogLevel::Debug) {
       Logger::debug("Compiling compute pipeline..."); 
@@ -99,6 +102,9 @@ namespace dxvk {
     
     DxvkShaderModuleCreateInfo moduleInfo;
     moduleInfo.fsDualSrcBlend = false;
+    moduleInfo.freezeBoolSpec = dxvkWineHuaFreezeBoolSpec(m_pipeMgr->m_device);
+    moduleInfo.boolSpecMask = &state.bsBindingMask;
+    moduleInfo.boolSpecCount = m_layout->bindingCount();
 
     auto csm = m_shaders.cs->createShaderModule(m_vkd, m_slotMapping, moduleInfo);
 
@@ -117,6 +123,8 @@ namespace dxvk {
     if (Logger::logLevel() <= LogLevel::Debug)
       t0 = dxvk::high_resolution_clock::now();
     
+    winehuaFlowTrace("compute-pipeline vkCreate begin");
+
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (m_vkd->vkCreateComputePipelines(m_vkd->device(),
           m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
@@ -124,6 +132,8 @@ namespace dxvk {
       Logger::err(str::format("  cs  : ", m_shaders.cs->debugName()));
       return VK_NULL_HANDLE;
     }
+
+    winehuaFlowTrace("compute-pipeline vkCreate end");
     
     if (Logger::logLevel() <= LogLevel::Debug) {
       t1 = dxvk::high_resolution_clock::now();

@@ -4,6 +4,45 @@
 #include "./log/log.h"
 
 namespace dxvk {
+
+#if defined(DXVK_NATIVE_OHOS)
+
+  HMONITOR GetDefaultMonitor() {
+    return nullptr;
+  }
+
+  BOOL SetMonitorDisplayMode(HMONITOR, DEVMODEW*) {
+    return FALSE;
+  }
+
+  BOOL GetMonitorDisplayMode(HMONITOR, DWORD, DEVMODEW*) {
+    return FALSE;
+  }
+
+  BOOL RestoreMonitorDisplayMode() {
+    return TRUE;
+  }
+
+  void GetWindowClientSize(HWND, UINT* pWidth, UINT* pHeight) {
+    if (pWidth)
+      *pWidth = 0;
+    if (pHeight)
+      *pHeight = 0;
+  }
+
+  void GetMonitorClientSize(HMONITOR, UINT* pWidth, UINT* pHeight) {
+    if (pWidth)
+      *pWidth = 0;
+    if (pHeight)
+      *pHeight = 0;
+  }
+
+  void GetMonitorRect(HMONITOR, RECT* pRect) {
+    if (pRect)
+      *pRect = RECT { 0, 0, 0, 0 };
+  }
+
+#else
   
   HMONITOR GetDefaultMonitor() {
     return ::MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -158,5 +197,7 @@ namespace dxvk {
 
     *pRect = monInfo.rcMonitor;
   }
+
+#endif
 
 }

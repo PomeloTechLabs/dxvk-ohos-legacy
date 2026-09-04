@@ -317,6 +317,9 @@ namespace dxvk {
    * used by DXVK if supported by the implementation.
    */
   struct DxvkInstanceExtensions {
+    #if defined(DXVK_NATIVE_OHOS)
+    DxvkExt ohosSurface = { VK_OHOS_SURFACE_EXTENSION_NAME, DxvkExtMode::Required };
+    #endif
     DxvkExt extDebugUtils                   = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME,                      DxvkExtMode::Optional };
     DxvkExt khrGetSurfaceCapabilities2      = { VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,       DxvkExtMode::Optional };
     DxvkExt khrSurface                      = { VK_KHR_SURFACE_EXTENSION_NAME,                          DxvkExtMode::Required };

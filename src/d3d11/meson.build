@@ -1,9 +1,11 @@
-d3d11_res = wrc_generator.process('version.rc')
+d3d11_res = []
+if not dxvk_native_ohos
+  d3d11_res = wrc_generator.process('version.rc')
+endif
 
 dxgi_common_src = [
   '../dxgi/dxgi_format.cpp',
   '../dxgi/dxgi_monitor.cpp',
-  '../dxgi/dxgi_swapchain.cpp',
 ]
 
 d3d10_src = [
@@ -25,6 +27,7 @@ d3d10_src = [
 
 d3d11_src = [
   'd3d11_annotation.cpp',
+  'd3d11_bc.cpp',
   'd3d11_blend.cpp',
   'd3d11_buffer.cpp',
   'd3d11_class_linkage.cpp',
@@ -38,6 +41,7 @@ d3d11_src = [
   'd3d11_device.cpp',
   'd3d11_enums.cpp',
   'd3d11_fence.cpp',
+  'd3d11_format_convert.cpp',
   'd3d11_gdi.cpp',
   'd3d11_initializer.cpp',
   'd3d11_input_layout.cpp',
@@ -51,7 +55,6 @@ d3d11_src = [
   'd3d11_shader.cpp',
   'd3d11_state.cpp',
   'd3d11_state_object.cpp',
-  'd3d11_swapchain.cpp',
   'd3d11_texture.cpp',
   'd3d11_util.cpp',
   'd3d11_video.cpp',
@@ -61,19 +64,32 @@ d3d11_src = [
   'd3d11_view_uav.cpp',
 ]
 
+dxgi_common_src += files('../dxgi/dxgi_swapchain.cpp')
+d3d11_src += files('d3d11_swapchain.cpp')
+
 d3d11_shaders = files([
   'shaders/d3d11_video_blit_frag.frag',
   'shaders/d3d11_video_blit_vert.vert',
 ])
 
-d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src + d3d10_src,
-    glsl_generator.process(d3d11_shaders), d3d11_res,
-  name_prefix         : '',
-  dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep ],
-  include_directories : dxvk_include_path,
-  install             : true,
-  vs_module_defs      : 'd3d11'+def_spec_ext,
-)
+if dxvk_native_ohos
+  d3d11_dll = shared_library('dxvk_d3d11', dxgi_common_src + d3d11_src + d3d10_src,
+      glsl_generator.process(d3d11_shaders),
+    dependencies        : [ dxgi_dep, dxbc_dep, dxvk_dep ],
+    include_directories : dxvk_include_path,
+    install             : true,
+    version             : dxvk_so_version,
+  )
+else
+  d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src + d3d10_src,
+      glsl_generator.process(d3d11_shaders), d3d11_res,
+    name_prefix         : '',
+    dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep ],
+    include_directories : dxvk_include_path,
+    install             : true,
+    vs_module_defs      : 'd3d11'+def_spec_ext,
+  )
+endif
 
 d3d11_dep = declare_dependency(
   link_with           : [ d3d11_dll ],

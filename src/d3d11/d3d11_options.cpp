@@ -40,12 +40,15 @@ namespace dxvk {
 
     auto cachedDynamicResources = config.getOption<std::string>("d3d11.cachedDynamicResources", std::string());
 
+    #if !defined(DXVK_NATIVE_OHOS)
     if (::GetModuleHandle("dxgitrace.dll")) {
       // apitrace reads back all mapped resources on the CPU, so
       // allocating everything in cached memory is necessary to
       // achieve acceptable performance
       this->cachedDynamicResources = ~0u;
-    } else {
+    } else
+    #endif
+    {
       this->cachedDynamicResources = 0u;
 
       for (char c : cachedDynamicResources) {

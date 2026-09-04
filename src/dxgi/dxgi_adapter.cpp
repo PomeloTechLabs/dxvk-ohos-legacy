@@ -142,6 +142,12 @@ namespace dxvk {
     
     if (ppOutput == nullptr)
       return E_INVALIDARG;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    // Native output enumeration is provided by the OHNativeWindow presenter in
+    // G5. A Win32 monitor handle is not meaningful on OpenHarmony.
+    return DXGI_ERROR_NOT_FOUND;
+    #else
     
     MonitorEnumInfo info;
     info.iMonitorId = Output;
@@ -156,6 +162,7 @@ namespace dxvk {
     
     *ppOutput = ref(new DxgiOutput(m_factory, this, info.oMonitor));
     return S_OK;
+    #endif
   }
   
   
@@ -403,6 +410,10 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE DxgiAdapter::RegisterVideoMemoryBudgetChangeNotificationEvent(
           HANDLE                        hEvent,
           DWORD*                        pdwCookie) {
+    #if defined(DXVK_NATIVE_OHOS)
+    Logger::warn("DxgiAdapter::RegisterVideoMemoryBudgetChangeNotificationEvent: Windows HANDLE events are unavailable in native OpenHarmony mode.");
+    return E_NOTIMPL;
+    #else
     if (!hEvent || !pdwCookie)
       return DXGI_ERROR_INVALID_CALL;
 
@@ -420,6 +431,7 @@ namespace dxvk {
 
     *pdwCookie = cookie;
     return S_OK;
+    #endif
   }
   
 
@@ -470,13 +482,17 @@ namespace dxvk {
       if (budgetChanged) {
         memoryInfoOld = memoryInfoNew;
 
-        for (const auto& pair : m_eventMap)
+        for (const auto& pair : m_eventMap) {
+          #if !defined(DXVK_NATIVE_OHOS)
           SetEvent(pair.second);
+          #endif
+        }
       }
     }
   }
   
   
+  #if !defined(DXVK_NATIVE_OHOS)
   BOOL CALLBACK DxgiAdapter::MonitorEnumProc(
           HMONITOR                  hmon,
           HDC                       hdc,
@@ -490,5 +506,6 @@ namespace dxvk {
     data->oMonitor = hmon;
     return FALSE; /* stop */
   }
+  #endif
   
 }

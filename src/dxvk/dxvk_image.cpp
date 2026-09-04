@@ -1,6 +1,8 @@
 #include "dxvk_image.h"
 
+#include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
+#include "dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -153,6 +155,29 @@ namespace dxvk {
     if (m_vkd->vkBindImageMemory(m_vkd->device(), m_image.image,
           m_image.memory.memory(), m_image.memory.offset()) != VK_SUCCESS)
       throw DxvkError("DxvkImage::DxvkImage: Failed to bind device memory");
+
+    if (winehuaSampleTraceEnabled()
+     && (createInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT)
+     && (createInfo.format == VK_FORMAT_R8G8B8A8_UNORM
+      || createInfo.format == VK_FORMAT_D16_UNORM
+      || createInfo.format == VK_FORMAT_X8_D24_UNORM_PACK32
+      || createInfo.format == VK_FORMAT_D32_SFLOAT
+      || createInfo.format == VK_FORMAT_D16_UNORM_S8_UINT
+      || createInfo.format == VK_FORMAT_D24_UNORM_S8_UINT
+      || createInfo.format == VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+      winehuaSampleTrace(str::format(
+        "image-create format=", createInfo.format,
+        " imageHandle=0x", std::hex, m_image.image,
+        " extent=", std::dec,
+        createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth,
+        " mips=", createInfo.mipLevels, " layers=", createInfo.numLayers,
+        " samples=", createInfo.sampleCount,
+        " tiling=", createInfo.tiling, " flags=0x", std::hex, createInfo.flags,
+        " usage=0x", createInfo.usage, " stages=0x", createInfo.stages,
+        " access=0x", createInfo.access,
+        " layout=", createInfo.layout, " initialLayout=", createInfo.initialLayout,
+        " memoryOffset=", m_image.memory.offset(), " memoryLength=", m_image.memory.length()));
+    }
   }
   
   
@@ -174,6 +199,54 @@ namespace dxvk {
     // the image is implementation-handled or not
     if (m_image.memory.memory() != VK_NULL_HANDLE)
       m_vkd->vkDestroyImage(m_vkd->device(), m_image.image, nullptr);
+  }
+
+
+  VkResult DxvkImage::flushMappedRange(
+          VkDeviceSize offset,
+          VkDeviceSize length,
+          DxvkCommandList* commandList) const {
+    return syncMappedRange(offset, length, false, commandList);
+  }
+
+
+  VkResult DxvkImage::invalidateMappedRange(
+          VkDeviceSize offset,
+          VkDeviceSize length) const {
+    return syncMappedRange(offset, length, true, nullptr);
+  }
+
+
+  VkResult DxvkImage::syncMappedRange(
+          VkDeviceSize offset,
+          VkDeviceSize length,
+          bool         invalidate,
+          DxvkCommandList* commandList) const {
+    if (!m_image.memory || offset >= m_image.memory.length())
+      return VK_ERROR_MEMORY_MAP_FAILED;
+
+    length = std::min(length, m_image.memory.length() - offset);
+    if (!length)
+      return VK_SUCCESS;
+
+    const VkDeviceSize atom =
+      m_device->properties().core.properties.limits.nonCoherentAtomSize;
+    const VkDeviceSize rangeBegin = m_image.memory.offset() + offset;
+    const VkDeviceSize rangeEnd = align(rangeBegin + length, atom);
+    VkMappedMemoryRange range;
+    range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.pNext  = nullptr;
+    range.memory = m_image.memory.memory();
+    range.offset = (rangeBegin / atom) * atom;
+    range.size   = rangeEnd - range.offset;
+
+    if (invalidate)
+      return m_vkd->vkInvalidateMappedMemoryRanges(m_vkd->device(), 1, &range);
+
+    return winehuaBatchMappedFlush() && commandList
+      ? commandList->queueWineHuaMappedFlush(
+          Rc<DxvkResource>(const_cast<DxvkImage*>(this)), range)
+      : m_vkd->vkFlushMappedMemoryRanges(m_vkd->device(), 1, &range);
   }
 
 
@@ -363,6 +436,28 @@ namespace dxvk {
         "\n    Samples:       ", m_image->info().sampleCount,
         "\n    Usage:         ", std::hex, m_image->info().usage,
         "\n    Tiling:        ", m_image->info().tiling));
+    }
+
+    if (winehuaSampleTraceEnabled()
+     && (m_image->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT)
+     && (m_image->info().format == VK_FORMAT_R8G8B8A8_UNORM
+      || m_image->info().format == VK_FORMAT_D16_UNORM
+      || m_image->info().format == VK_FORMAT_X8_D24_UNORM_PACK32
+      || m_image->info().format == VK_FORMAT_D32_SFLOAT
+      || m_image->info().format == VK_FORMAT_D16_UNORM_S8_UINT
+      || m_image->info().format == VK_FORMAT_D24_UNORM_S8_UINT
+      || m_image->info().format == VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+      winehuaSampleTrace(str::format(
+        "image-view cookie=", m_cookie, " type=", type,
+        " imageHandle=0x", std::hex, m_image->handle(),
+        " viewHandle=0x", m_views[type],
+        " imageFormat=", std::dec, m_image->info().format,
+        " viewFormat=", viewInfo.format, " usage=0x", std::hex, m_info.usage,
+        " aspect=0x", viewInfo.subresourceRange.aspectMask,
+        " baseMip=", viewInfo.subresourceRange.baseMipLevel,
+        " mipCount=", viewInfo.subresourceRange.levelCount,
+        " baseLayer=", viewInfo.subresourceRange.baseArrayLayer,
+        " layerCount=", viewInfo.subresourceRange.layerCount));
     }
   }
   

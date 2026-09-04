@@ -30,6 +30,10 @@ namespace dxvk {
     
     bool Compare(
       const D3D11InputLayout*     pOther) const;
+
+    const std::vector<DxvkVertexBinding>& GetBindings() const {
+      return m_bindings;
+    }
     
     D3D10InputLayout* GetD3D10Iface() {
       return &m_d3d10;

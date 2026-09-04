@@ -3,6 +3,7 @@
 #include "d3d11_device.h"
 #include "d3d11_fence.h"
 #include "d3d11_texture.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
@@ -84,7 +85,15 @@ namespace dxvk {
 
     // Get query status directly from the query object
     auto query = static_cast<D3D11Query*>(pAsync);
+    winehuaQueryTrace(str::format(
+      "d3d11-get-data begin query=", query,
+      " event=", query->IsEvent() ? 1 : 0,
+      " size=", DataSize,
+      " flags=", GetDataFlags));
     HRESULT hr = query->GetData(pData, GetDataFlags);
+    winehuaQueryTrace(str::format(
+      "d3d11-get-data end query=", query,
+      " hr=", int32_t(hr)));
     
     // If we're likely going to spin on the asynchronous object,
     // flush the context so that we're keeping the GPU busy.
@@ -160,6 +169,21 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::Flush1(
           D3D11_CONTEXT_TYPE          ContextType,
           HANDLE                      hEvent) {
+    const bool hasPendingCommands = m_csIsBusy || !m_csChunk->empty();
+    if (hasPendingCommands || hEvent) {
+      winehuaFlowTrace(str::format(
+        "d3d11-flush begin pending=", hasPendingCommands ? 1 : 0,
+        " context-type=", uint32_t(ContextType),
+        " event=", hEvent ? 1 : 0));
+    } else {
+      static std::atomic<uint32_t> emptyFlushes { 0 };
+      const uint32_t index = emptyFlushes.fetch_add(1, std::memory_order_relaxed);
+      if (index < 8)
+        winehuaFlowTrace(str::format("d3d11-flush empty index=", index));
+      else if (index == 8)
+        winehuaFlowTrace("d3d11-flush empty records suppressed");
+    }
+
     m_parent->FlushInitContext();
 
     if (hEvent)
@@ -180,6 +204,10 @@ namespace dxvk {
       m_lastFlush = dxvk::high_resolution_clock::now();
       m_csIsBusy  = false;
     }
+
+    if (hasPendingCommands || hEvent)
+      winehuaFlowTrace(str::format(
+        "d3d11-flush end submitted=", hasPendingCommands ? 1 : 0));
   }
   
   
@@ -229,6 +257,10 @@ namespace dxvk {
           BOOL                RestoreContextState) {
     D3D10DeviceLock lock = LockContext();
 
+    winehuaFlowTrace(str::format(
+      "d3d11-execute-command-list begin list=", pCommandList,
+      " restore=", RestoreContextState ? 1 : 0));
+
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
     
     // Flush any outstanding commands so that
@@ -243,6 +275,9 @@ namespace dxvk {
     // restore the immediate context's state
     uint64_t csSeqNum = commandList->EmitToCsThread(&m_csThread);
     m_csSeqNum = std::max(m_csSeqNum, csSeqNum);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-execute-command-list emitted seq=", csSeqNum));
     
     if (RestoreContextState)
       RestoreState();
@@ -279,6 +314,13 @@ namespace dxvk {
     D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     pResource->GetType(&resourceDim);
 
+    winehuaFlowTrace(str::format(
+      "d3d11-map begin resource=", pResource,
+      " dimension=", uint32_t(resourceDim),
+      " subresource=", Subresource,
+      " type=", uint32_t(MapType),
+      " flags=", MapFlags));
+
     HRESULT hr;
     
     if (likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)) {
@@ -294,6 +336,13 @@ namespace dxvk {
 
     if (unlikely(FAILED(hr)))
       *pMappedResource = D3D11_MAPPED_SUBRESOURCE();
+    else if (resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)
+      static_cast<D3D11Buffer*>(pResource)->SetMapType(MapType);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-map end resource=", pResource,
+      " dimension=", uint32_t(resourceDim),
+      " hr=", int32_t(hr)));
 
     return hr;
   }
@@ -302,6 +351,29 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
+    winehuaFlowTrace(str::format(
+      "d3d11-unmap begin resource=", pResource,
+      " subresource=", Subresource));
+
+    if (winehuaFlushDynamicMapped() && pResource) {
+      D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      pResource->GetType(&resourceDim);
+
+      if (resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        auto buffer = static_cast<D3D11Buffer*>(pResource);
+        const D3D11_MAP mapType = buffer->GetMapType();
+        buffer->SetMapType(D3D11_MAP(~0u));
+        if (mapType != D3D11_MAP(~0u) && mapType != D3D11_MAP_READ) {
+          EmitCs([
+            cBuffer = buffer->GetBuffer(),
+            cSlice  = buffer->GetMappedSlice()
+          ] (DxvkContext* ctx) {
+            ctx->flushMappedBuffer(cBuffer, cSlice);
+          });
+        }
+      }
+    }
+
     // Since it is very uncommon for images to be mapped compared
     // to buffers, we count the currently mapped images in order
     // to avoid a virtual method call in the common case.
@@ -314,6 +386,10 @@ namespace dxvk {
         UnmapImage(GetCommonTexture(pResource), Subresource);
       }
     }
+
+    winehuaFlowTrace(str::format(
+      "d3d11-unmap end resource=", pResource,
+      " subresource=", Subresource));
   }
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::UpdateSubresource(
@@ -323,8 +399,20 @@ namespace dxvk {
     const void*                             pSrcData,
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch) {
+    winehuaFlowTrace(str::format(
+      "d3d11-update begin resource=", pDstResource,
+      " subresource=", DstSubresource,
+      " box=", pDstBox ? 1 : 0,
+      " source=", pSrcData ? 1 : 0,
+      " row-pitch=", SrcRowPitch,
+      " depth-pitch=", SrcDepthPitch));
+
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, 0);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-update end resource=", pDstResource,
+      " subresource=", DstSubresource));
   }
 
   
@@ -336,8 +424,21 @@ namespace dxvk {
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch,
           UINT                              CopyFlags) {
+    winehuaFlowTrace(str::format(
+      "d3d11-update1 begin resource=", pDstResource,
+      " subresource=", DstSubresource,
+      " box=", pDstBox ? 1 : 0,
+      " source=", pSrcData ? 1 : 0,
+      " row-pitch=", SrcRowPitch,
+      " depth-pitch=", SrcDepthPitch,
+      " copy-flags=", CopyFlags));
+
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
+
+    winehuaFlowTrace(str::format(
+      "d3d11-update1 end resource=", pDstResource,
+      " subresource=", DstSubresource));
   }
   
   
@@ -389,6 +490,13 @@ namespace dxvk {
       // it as the 'new' mapped slice. This assumes that the
       // only way to invalidate a buffer is by mapping it.
       auto physSlice = pResource->DiscardSlice();
+      if (pResource->Desc()->BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+        winehuaSampleTrace(str::format(
+          "dynamic-cb-map buffer=", pResource->GetBuffer().operator->(),
+          " handle=0x", std::hex, physSlice.handle,
+          " offset=", std::dec, physSlice.offset,
+          " length=", physSlice.length));
+      }
       pMappedResource->pData      = physSlice.mapPtr;
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
@@ -400,6 +508,9 @@ namespace dxvk {
         ctx->invalidateBuffer(cBuffer, cBufferSlice);
       });
 
+      if (winehuaFlushDynamicMapped())
+        pResource->GetBuffer()->beginMappedSliceWrite(physSlice);
+
       return S_OK;
     } else if (likely(MapType == D3D11_MAP_WRITE_NO_OVERWRITE)) {
       // Put this on a fast path without any extra checks since it's
@@ -408,6 +519,8 @@ namespace dxvk {
       pMappedResource->pData      = physSlice.mapPtr;
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
+      if (winehuaFlushDynamicMapped())
+        pResource->GetBuffer()->beginMappedSliceWrite(physSlice);
       return S_OK;
     } else {
       // Quantum Break likes using MAP_WRITE on resources which would force
@@ -445,6 +558,8 @@ namespace dxvk {
           ctx->invalidateBuffer(cBuffer, cBufferSlice);
         });
 
+        if (winehuaFlushDynamicMapped())
+          pResource->GetBuffer()->beginMappedSliceWrite(physSlice);
         std::memcpy(physSlice.mapPtr, prevSlice.mapPtr, physSlice.length);
         pMappedResource->pData      = physSlice.mapPtr;
         pMappedResource->RowPitch   = bufferSize;
@@ -455,9 +570,15 @@ namespace dxvk {
           return DXGI_ERROR_WAS_STILL_DRAWING;
 
         DxvkBufferSliceHandle physSlice = pResource->GetMappedSlice();
+        if (winehuaPreciseShadowEnabled()
+         && (MapType == D3D11_MAP_READ || MapType == D3D11_MAP_READ_WRITE)
+         && pResource->GetBuffer()->invalidateMappedSlice(physSlice) != VK_SUCCESS)
+          return E_FAIL;
         pMappedResource->pData      = physSlice.mapPtr;
         pMappedResource->RowPitch   = bufferSize;
         pMappedResource->DepthPitch = bufferSize;
+        if (winehuaFlushDynamicMapped() && MapType != D3D11_MAP_READ)
+          pResource->GetBuffer()->beginMappedSliceWrite(physSlice);
         return S_OK;
       }
     }
@@ -598,6 +719,39 @@ namespace dxvk {
       }
     }
 
+    const auto traceSubresource = pResource->GetSubresourceFromIndex(
+      formatInfo->aspectMask, Subresource);
+    const auto traceExtent = pResource->MipLevelExtent(traceSubresource.mipLevel);
+    const bool traceAlpha = MapType == D3D11_MAP_READ
+      && traceSubresource.mipLevel == 0
+      && formatInfo->elementSize == 4
+      && !formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
+      && !formatInfo->flags.test(DxvkFormatFlag::MultiPlane);
+    const auto traceLayout = pResource->GetSubresourceLayout(
+      formatInfo->aspectMask, Subresource);
+    auto* tracePtr = reinterpret_cast<char*>(mapPtr) + traceLayout.Offset;
+
+    if (traceAlpha)
+      winehuaTraceRgbaAlpha("map-before-invalidate", tracePtr,
+        traceExtent.width, traceExtent.height, traceLayout.RowPitch,
+        uint32_t(packedFormat), Subresource, traceSubresource.arrayLayer);
+
+    if (winehuaPreciseShadowEnabled()
+     && (MapType == D3D11_MAP_READ || MapType == D3D11_MAP_READ_WRITE)) {
+      const auto layout = pResource->GetSubresourceLayout(
+        formatInfo->aspectMask, Subresource);
+      const VkResult result = mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT
+        ? mappedImage->invalidateMappedRange(layout.Offset, layout.Size)
+        : mappedBuffer->invalidateMappedSlice(pResource->GetMappedSlice(Subresource));
+      if (result != VK_SUCCESS)
+        return E_FAIL;
+    }
+
+    if (traceAlpha)
+      winehuaTraceRgbaAlpha("map-after-invalidate", tracePtr,
+        traceExtent.width, traceExtent.height, traceLayout.RowPitch,
+        uint32_t(packedFormat), Subresource, traceSubresource.arrayLayer);
+
     // Mark the given subresource as mapped
     pResource->SetMapType(Subresource, MapType);
 
@@ -625,6 +779,35 @@ namespace dxvk {
     // Decrement mapped image counter only after making sure
     // the given subresource is actually mapped right now
     m_mappedImageCount -= 1;
+
+    if (winehuaPreciseShadowEnabled() && mapType != D3D11_MAP_READ) {
+      const auto formatInfo = imageFormatInfo(pResource->GetPackedFormat());
+      const auto layout = pResource->GetSubresourceLayout(
+        formatInfo->aspectMask, Subresource);
+      if (pResource->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT) {
+        EmitCs([
+          cImage  = pResource->GetImage(),
+          cOffset = layout.Offset,
+          cLength = layout.Size
+        ] (DxvkContext* ctx) {
+          ctx->flushMappedImage(cImage, cOffset, cLength);
+        });
+      } else {
+        auto mappedBuffer = pResource->GetMappedBuffer(Subresource);
+        auto mappedSlice = pResource->GetMappedSlice(Subresource);
+
+        if (pResource->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
+          mappedBuffer->flushMappedSlice(mappedSlice);
+        } else {
+          EmitCs([
+            cBuffer = std::move(mappedBuffer),
+            cSlice  = mappedSlice
+          ] (DxvkContext* ctx) {
+            ctx->flushMappedBuffer(cBuffer, cSlice);
+          });
+        }
+      }
+    }
 
     if ((mapType != D3D11_MAP_READ) &&
         (pResource->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER)) {
@@ -661,7 +844,19 @@ namespace dxvk {
       slice = pDstBuffer->GetMappedSlice();
     }
 
+    if (winehuaFlushDynamicMapped())
+      pDstBuffer->GetBuffer()->beginMappedSliceWrite(slice);
+
     std::memcpy(reinterpret_cast<char*>(slice.mapPtr) + Offset, pSrcData, Length);
+
+    if (winehuaFlushDynamicMapped()) {
+      EmitCs([
+        cBuffer = pDstBuffer->GetBuffer(),
+        cSlice  = slice
+      ] (DxvkContext* ctx) {
+        ctx->flushMappedBuffer(cBuffer, cSlice);
+      });
+    }
   }
 
 
@@ -796,13 +991,40 @@ namespace dxvk {
                      + IncFlushIntervalUs * pending;
 
       // Prevent flushing too often in short intervals.
-      if (now - m_lastFlush >= std::chrono::microseconds(delay))
+      if (now - m_lastFlush >= std::chrono::microseconds(delay)) {
+        if (StrongHint || pending > 1) {
+          static std::atomic<uint32_t> strongFlushes { 0 };
+          const uint32_t index = strongFlushes.fetch_add(1, std::memory_order_relaxed);
+          if (index < 16)
+            winehuaFlowTrace(str::format(
+              "d3d11-flush-implicit strong index=", index,
+              " hint=", StrongHint ? 1 : 0,
+              " pending=", pending,
+              " action=flush"));
+          else if (index == 16)
+            winehuaFlowTrace("d3d11-flush-implicit strong records suppressed");
+        } else {
+          static std::atomic<uint32_t> weakFlushes { 0 };
+          const uint32_t index = weakFlushes.fetch_add(1, std::memory_order_relaxed);
+          if (index < 16)
+            winehuaFlowTrace(str::format(
+              "d3d11-flush-implicit weak index=", index,
+              " pending=", pending,
+              " action=flush"));
+          else if (index == 16)
+            winehuaFlowTrace("d3d11-flush-implicit weak records suppressed");
+        }
         Flush();
+      }
     }
   }
 
 
   void D3D11ImmediateContext::SignalEvent(HANDLE hEvent) {
+    #if defined(DXVK_NATIVE_OHOS)
+    Logger::warn("D3D11ImmediateContext::SignalEvent: Windows HANDLE events are unavailable in native OpenHarmony mode.");
+    return;
+    #else
     uint64_t value = ++m_eventCount;
 
     if (m_eventSignal == nullptr)
@@ -818,6 +1040,7 @@ namespace dxvk {
     ] (DxvkContext* ctx) {
       ctx->signal(cSignal, cValue);
     });
+    #endif
   }
   
 }

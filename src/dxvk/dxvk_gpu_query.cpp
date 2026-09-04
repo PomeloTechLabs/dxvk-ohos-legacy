@@ -3,6 +3,7 @@
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
 #include "dxvk_gpu_query.h"
+#include "dxvk_winehua_trace.h"
 
 namespace dxvk {
 
@@ -95,6 +96,10 @@ namespace dxvk {
       handle.queryPool, handle.queryId, 1,
       sizeof(DxvkQueryData), &tmpData,
       sizeof(DxvkQueryData), VK_QUERY_RESULT_64_BIT);
+
+    winehuaQueryTrace(str::format(
+      "result query=", this, " pool=", handle.queryPool,
+      " id=", handle.queryId, " vkResult=", result));
     
     if (result == VK_NOT_READY)
       return DxvkGpuQueryStatus::Pending;
@@ -346,6 +351,10 @@ namespace dxvk {
     const Rc<DxvkCommandList>&  cmd,
     const Rc<DxvkGpuQuery>&     query) {
     DxvkGpuQueryHandle handle = m_pool->allocQuery(query->type());
+
+    winehuaQueryTrace(str::format(
+      "begin query=", query.operator->(), " pool=", handle.queryPool,
+      " id=", handle.queryId, " type=", query->type()));
     
     cmd->resetQuery(
       handle.queryPool,
@@ -372,6 +381,10 @@ namespace dxvk {
     const Rc<DxvkCommandList>&  cmd,
     const Rc<DxvkGpuQuery>&     query) {
     DxvkGpuQueryHandle handle = query->handle();
+
+    winehuaQueryTrace(str::format(
+      "end query=", query.operator->(), " pool=", handle.queryPool,
+      " id=", handle.queryId, " type=", query->type()));
     
     if (query->isIndexed()) {
       cmd->cmdEndQueryIndexed(

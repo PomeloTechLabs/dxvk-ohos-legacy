@@ -43,6 +43,17 @@ namespace dxvk {
       case DxbcInstClass::TextureQueryLod:
       case DxbcInstClass::VectorDeriv: {
         m_analysis->usesDerivatives = true;
+
+        if ((ins.op == DxbcOpcode::SampleC || ins.op == DxbcOpcode::SampleClz)
+         && ins.src[1].type == DxbcOperandType::Resource)
+          m_analysis->srvInfos[ins.src[1].idx[0].offset].accessCubeArrayDref = true;
+
+        if (ins.op == DxbcOpcode::Gather4C || ins.op == DxbcOpcode::Gather4PoC) {
+          const uint32_t resourceOperand = ins.op == DxbcOpcode::Gather4PoC ? 2 : 1;
+          if (ins.src[resourceOperand].type == DxbcOperandType::Resource)
+            m_analysis->srvInfos[ins.src[resourceOperand].idx[0].offset]
+              .accessCubeArrayDref = true;
+        }
       } break;
       
       case DxbcInstClass::ControlFlow: {

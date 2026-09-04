@@ -14,10 +14,14 @@ namespace dxvk {
     m_flags = Flags;
 
     if (Flags & D3D11_FENCE_FLAG_SHARED) {
+      #if defined(DXVK_NATIVE_OHOS)
+      Logger::warn("D3D11Fence: shared fence handles are unavailable in native OpenHarmony mode.");
+      #else
       fenceInfo.sharedType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT;
       if (hFence == nullptr)
         hFence = INVALID_HANDLE_VALUE;
       fenceInfo.sharedHandle = hFence;
+      #endif
     }
 
     if (Flags & ~D3D11_FENCE_FLAG_SHARED)
@@ -58,6 +62,11 @@ namespace dxvk {
           DWORD               dwAccess,
           LPCWSTR             lpName,
           HANDLE*             pHandle) {
+    #if defined(DXVK_NATIVE_OHOS)
+    if (pHandle)
+      *pHandle = INVALID_HANDLE_VALUE;
+    return E_NOTIMPL;
+    #else
     if (!(m_flags & D3D11_FENCE_FLAG_SHARED))
       return E_INVALIDARG;
 
@@ -74,12 +83,16 @@ namespace dxvk {
 
     *pHandle = sharedHandle;
     return S_OK;
+    #endif
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D11Fence::SetEventOnCompletion(
           UINT64              Value,
           HANDLE              hEvent) {
+    #if defined(DXVK_NATIVE_OHOS)
+    return E_NOTIMPL;
+    #else
     // TODO in case of rewinds, the stored value may be higher.
     // For shared fences, calling vkWaitSemaphores here could alleviate the issue.
 
@@ -88,6 +101,7 @@ namespace dxvk {
     });
 
     return S_OK;
+    #endif
   }
 
 

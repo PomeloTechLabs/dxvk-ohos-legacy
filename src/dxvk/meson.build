@@ -87,8 +87,6 @@ dxvk_src = files([
   'dxvk_meta_mipgen.cpp',
   'dxvk_meta_pack.cpp',
   'dxvk_meta_resolve.cpp',
-  'dxvk_openvr.cpp',
-  'dxvk_openxr.cpp',
   'dxvk_options.cpp',
   'dxvk_pipecache.cpp',
   'dxvk_pipelayout.cpp',
@@ -108,13 +106,19 @@ dxvk_src = files([
   'dxvk_unbound.cpp',
   'dxvk_util.cpp',
 
-  'platform/dxvk_win32_exts.cpp',
-
   'hud/dxvk_hud.cpp',
   'hud/dxvk_hud_font.cpp',
   'hud/dxvk_hud_item.cpp',
   'hud/dxvk_hud_renderer.cpp',
 ])
+
+if not dxvk_native_ohos
+  dxvk_src += files([
+    'dxvk_openvr.cpp',
+    'dxvk_openxr.cpp',
+    'platform/dxvk_win32_exts.cpp',
+  ])
+endif
 
 thread_dep = dependency('threads')
 

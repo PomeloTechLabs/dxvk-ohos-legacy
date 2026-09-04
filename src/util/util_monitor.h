@@ -2,6 +2,23 @@
 
 #include "./com/com_include.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+  #ifndef CALLBACK
+    #define CALLBACK
+  #endif
+  using LPARAM = LONG_PTR;
+
+struct DEVMODEW {
+  WORD  dmSize             = sizeof(DEVMODEW);
+  DWORD dmFields           = 0;
+  DWORD dmBitsPerPel       = 0;
+  DWORD dmPelsWidth        = 0;
+  DWORD dmPelsHeight       = 0;
+  DWORD dmDisplayFlags     = 0;
+  DWORD dmDisplayFrequency = 0;
+};
+#endif
+
 namespace dxvk {
 
   /**

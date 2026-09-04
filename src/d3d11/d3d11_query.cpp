@@ -1,5 +1,6 @@
 #include "d3d11_device.h"
 #include "d3d11_query.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -10,11 +11,18 @@ namespace dxvk {
     m_desc(desc),
     m_state(D3D11_VK_QUERY_INITIAL),
     m_d3d10(this) {
+    winehuaQueryTrace(str::format(
+      "d3d11-query-create query=", this,
+      " type=", uint32_t(m_desc.Query),
+      " flags=", m_desc.MiscFlags));
+
     Rc<DxvkDevice> dxvkDevice = m_parent->GetDXVKDevice();
 
     switch (m_desc.Query) {
       case D3D11_QUERY_EVENT:
-        m_event[0] = dxvkDevice->createGpuEvent();
+        m_completionSignal = new sync::Fence(0);
+        winehuaQueryTrace(str::format(
+          "d3d11-query-event backend=submit-completion query=", this));
         break;
         
       case D3D11_QUERY_OCCLUSION:
@@ -41,37 +49,44 @@ namespace dxvk {
         break;
       
       case D3D11_QUERY_PIPELINE_STATISTICS:
-        m_query[0] = dxvkDevice->createGpuQuery(
-          VK_QUERY_TYPE_PIPELINE_STATISTICS, 0, 0);
+        if (dxvkDevice->features().core.features.pipelineStatisticsQuery) {
+          m_query[0] = dxvkDevice->createGpuQuery(
+            VK_QUERY_TYPE_PIPELINE_STATISTICS, 0, 0);
+        } else {
+          static std::atomic<bool> s_warnedPipelineStatistics { false };
+          if (!s_warnedPipelineStatistics.exchange(true))
+            Logger::warn("WineHua: pipeline statistics queries are unsupported by the Vulkan device; returning zero statistics");
+        }
         break;
       
       case D3D11_QUERY_SO_STATISTICS:
       case D3D11_QUERY_SO_STATISTICS_STREAM0:
       case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
       case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
-        // FIXME it is technically incorrect to map
-        // SO_OVERFLOW_PREDICATE to the first stream,
-        // but this is good enough for D3D10 behaviour
-        m_query[0] = dxvkDevice->createGpuQuery(
-          VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, 0);
-        break;
-      
       case D3D11_QUERY_SO_STATISTICS_STREAM1:
       case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
-        m_query[0] = dxvkDevice->createGpuQuery(
-          VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, 1);
-        break;
-      
       case D3D11_QUERY_SO_STATISTICS_STREAM2:
       case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
-        m_query[0] = dxvkDevice->createGpuQuery(
-          VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, 2);
-        break;
-      
       case D3D11_QUERY_SO_STATISTICS_STREAM3:
       case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
-        m_query[0] = dxvkDevice->createGpuQuery(
-          VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, 3);
+        if (dxvkDevice->features().extTransformFeedback.transformFeedback) {
+          uint32_t stream = 0;
+          switch (m_desc.Query) {
+            case D3D11_QUERY_SO_STATISTICS_STREAM1:
+            case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1: stream = 1; break;
+            case D3D11_QUERY_SO_STATISTICS_STREAM2:
+            case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2: stream = 2; break;
+            case D3D11_QUERY_SO_STATISTICS_STREAM3:
+            case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3: stream = 3; break;
+            default: break;
+          }
+          m_query[0] = dxvkDevice->createGpuQuery(
+            VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 0, stream);
+        } else {
+          static std::atomic<bool> s_warnedTransformFeedback { false };
+          if (!s_warnedTransformFeedback.exchange(true))
+            Logger::warn("WineHua: transform-feedback queries are unsupported by the Vulkan device; returning zero statistics");
+        }
         break;
       
       default:
@@ -178,6 +193,13 @@ namespace dxvk {
   
   
   void D3D11Query::Begin(DxvkContext* ctx) {
+    winehuaFlowTrace(str::format(
+      "d3d11-query-cmd-begin type=", uint32_t(m_desc.Query),
+      " query=", this));
+    winehuaQueryTrace(str::format(
+      "d3d11-query-cmd-begin query=", this,
+      " type=", uint32_t(m_desc.Query)));
+
     switch (m_desc.Query) {
       case D3D11_QUERY_EVENT:
       case D3D11_QUERY_TIMESTAMP:
@@ -188,15 +210,25 @@ namespace dxvk {
         break;
       
       default:
-        ctx->beginQuery(m_query[0]);
+        if (m_query[0] != nullptr)
+          ctx->beginQuery(m_query[0]);
     }
   }
   
   
   void D3D11Query::End(DxvkContext* ctx) {
+    winehuaFlowTrace(str::format(
+      "d3d11-query-cmd-end begin type=", uint32_t(m_desc.Query),
+      " query=", this));
+    winehuaQueryTrace(str::format(
+      "d3d11-query-cmd-end begin query=", this,
+      " type=", uint32_t(m_desc.Query),
+      " reset=", m_resetCtr.load(std::memory_order_relaxed)));
+
     switch (m_desc.Query) {
       case D3D11_QUERY_EVENT:
-        ctx->signalGpuEvent(m_event[0]);
+        ctx->signal(m_completionSignal,
+          m_completionValue.load(std::memory_order_acquire));
         break;
       
       case D3D11_QUERY_TIMESTAMP:
@@ -205,10 +237,19 @@ namespace dxvk {
         break;
       
       default:
-        ctx->endQuery(m_query[0]);
+        if (m_query[0] != nullptr)
+          ctx->endQuery(m_query[0]);
     }
 
     m_resetCtr.fetch_sub(1, std::memory_order_release);
+
+    winehuaQueryTrace(str::format(
+      "d3d11-query-cmd-end done query=", this,
+      " reset=", m_resetCtr.load(std::memory_order_relaxed)));
+    winehuaFlowTrace(str::format(
+      "d3d11-query-cmd-end done type=", uint32_t(m_desc.Query),
+      " query=", this,
+      " reset=", m_resetCtr.load(std::memory_order_relaxed)));
   }
   
   
@@ -217,6 +258,9 @@ namespace dxvk {
       return false;
 
     m_state = D3D11_VK_QUERY_BEGUN;
+    winehuaQueryTrace(str::format(
+      "d3d11-query-begin query=", this,
+      " type=", uint32_t(m_desc.Query)));
     return true;
   }
 
@@ -228,6 +272,11 @@ namespace dxvk {
 
     m_state = D3D11_VK_QUERY_ENDED;
     m_resetCtr.fetch_add(1, std::memory_order_acquire);
+    m_completionValue.fetch_add(1, std::memory_order_release);
+    winehuaQueryTrace(str::format(
+      "d3d11-query-end query=", this,
+      " type=", uint32_t(m_desc.Query),
+      " reset=", m_resetCtr.load(std::memory_order_relaxed)));
     return result;
   }
 
@@ -235,6 +284,12 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11Query::GetData(
           void*                             pData,
           UINT                              GetDataFlags) {
+    winehuaQueryTrace(str::format(
+      "d3d11-query-get-data query=", this,
+      " type=", uint32_t(m_desc.Query),
+      " state=", uint32_t(m_state),
+      " reset=", m_resetCtr.load(std::memory_order_relaxed)));
+
     if (m_state != D3D11_VK_QUERY_ENDED)
       return DXGI_ERROR_INVALID_CALL;
 
@@ -242,12 +297,21 @@ namespace dxvk {
       return S_FALSE;
 
     if (m_desc.Query == D3D11_QUERY_EVENT) {
-      DxvkGpuEventStatus status = m_event[0]->test();
+      bool signaled = false;
+      uint32_t statusValue = uint32_t(DxvkGpuEventStatus::Pending);
 
-      if (status == DxvkGpuEventStatus::Invalid)
-        return DXGI_ERROR_INVALID_CALL;
-      
-      bool signaled = status == DxvkGpuEventStatus::Signaled;
+      const uint64_t target = m_completionValue.load(std::memory_order_acquire);
+      const uint64_t completed = m_completionSignal->value();
+      signaled = completed >= target;
+      statusValue = signaled
+        ? uint32_t(DxvkGpuEventStatus::Signaled)
+        : uint32_t(DxvkGpuEventStatus::Pending);
+
+      if (m_traceEventStatus.exchange(statusValue, std::memory_order_relaxed) != statusValue)
+        winehuaFlowTrace(str::format(
+          "d3d11-event-status query=", this,
+          " backend=submit-completion",
+          " status=", statusValue));
 
       if (pData != nullptr)
         *static_cast<BOOL*>(pData) = signaled;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -10,6 +11,8 @@
 #include "dxvk_resource.h"
 
 namespace dxvk {
+
+  class DxvkCommandList;
 
   /**
    * \brief Buffer create info
@@ -239,6 +242,8 @@ namespace dxvk {
       if (unlikely(m_freeSlices.empty())) {
         std::unique_lock<sync::Spinlock> swapLock(m_swapMutex);
         std::swap(m_freeSlices, m_nextSlices);
+        if (m_fifoSlices)
+          std::reverse(m_freeSlices.begin(), m_freeSlices.end());
       }
 
       // If there are still no slices available, create a new
@@ -279,6 +284,21 @@ namespace dxvk {
       std::unique_lock<sync::Spinlock> swapLock(m_swapMutex);
       m_nextSlices.push_back(slice);
     }
+
+    /**
+     * \brief Flushes the memory backing a mapped slice
+     *
+     * WineHua's Venus vtest bridge uses a separate Host Vulkan mapping.
+     * The opt-in compatibility path needs an explicit Vulkan flush to
+     * publish CPU writes before an older fence can refresh the shadow map.
+     */
+    VkResult flushMappedSlice(
+      const DxvkBufferSliceHandle& slice,
+            DxvkCommandList*       commandList = nullptr) const;
+
+    VkResult beginMappedSliceWrite(const DxvkBufferSliceHandle& slice) const;
+
+    VkResult invalidateMappedSlice(const DxvkBufferSliceHandle& slice) const;
     
   private:
 
@@ -295,6 +315,7 @@ namespace dxvk {
     sync::Spinlock          m_freeMutex;
 
     uint32_t                m_lazyAlloc = false;
+    bool                    m_fifoSlices = false;
     VkDeviceSize            m_physSliceLength   = 0;
     VkDeviceSize            m_physSliceStride   = 0;
     VkDeviceSize            m_physSliceCount    = 1;

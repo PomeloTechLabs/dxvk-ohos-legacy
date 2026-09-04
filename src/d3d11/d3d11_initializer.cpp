@@ -1,7 +1,9 @@
 #include <cstring>
 
+#include "d3d11_bc.h"
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
 
@@ -23,13 +25,23 @@ namespace dxvk {
   void D3D11Initializer::Flush() {
     std::lock_guard<dxvk::mutex> lock(m_mutex);
 
-    if (m_transferCommands != 0)
+    if (m_transferCommands != 0) {
+      winehuaFlowTrace(str::format(
+        "d3d11-init-flush commands=", m_transferCommands,
+        " bytes=", m_transferMemory));
       FlushInternal();
+    }
   }
 
   void D3D11Initializer::InitBuffer(
           D3D11Buffer*                pBuffer,
     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+    winehuaFlowTrace(str::format(
+      "d3d11-init-buffer size=", pBuffer->Desc()->ByteWidth,
+      " usage=", uint32_t(pBuffer->Desc()->Usage),
+      " bind=", pBuffer->Desc()->BindFlags,
+      " initial=", pInitialData && pInitialData->pSysMem ? 1 : 0));
+
     VkMemoryPropertyFlags memFlags = pBuffer->GetBuffer()->memFlags();
 
     (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
@@ -41,6 +53,16 @@ namespace dxvk {
   void D3D11Initializer::InitTexture(
           D3D11CommonTexture*         pTexture,
     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+    const auto desc = pTexture->Desc();
+    winehuaFlowTrace(str::format(
+      "d3d11-init-texture size=", desc->Width, "x", desc->Height, "x", desc->Depth,
+      " mips=", desc->MipLevels,
+      " layers=", desc->ArraySize,
+      " format=", uint32_t(desc->Format),
+      " usage=", uint32_t(desc->Usage),
+      " bind=", desc->BindFlags,
+      " initial=", pInitialData && pInitialData->pSysMem ? 1 : 0));
+
     (pTexture->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
       ? InitHostVisibleTexture(pTexture, pInitialData)
       : InitDeviceLocalTexture(pTexture, pInitialData);
@@ -109,6 +131,9 @@ namespace dxvk {
         bufferSlice.mapPtr(0), 0,
         bufferSlice.length());
     }
+    if (winehuaFlushDynamicMapped())
+      m_context->flushMappedBuffer(
+        bufferSlice.buffer(), bufferSlice.getSliceHandle());
   }
 
 
@@ -137,9 +162,46 @@ namespace dxvk {
           VkOffset3D mipLevelOffset = { 0, 0, 0 };
           VkExtent3D mipLevelExtent = pTexture->MipLevelExtent(level);
 
+          if (level == 0 && formatInfo->elementSize == 4
+           && !formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
+           && !formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+            winehuaTraceRgbaAlpha("init-src",
+              pInitialData[id].pSysMem,
+              mipLevelExtent.width, mipLevelExtent.height,
+              pInitialData[id].SysMemPitch, uint32_t(packedFormat), id, layer);
+          }
+
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
+            const void* uploadData = pInitialData[id].pSysMem;
+            VkDeviceSize uploadRowPitch = pInitialData[id].SysMemPitch;
+            VkDeviceSize uploadSlicePitch = pInitialData[id].SysMemSlicePitch;
+            D3D11CpuImage converted;
+
+            const bool bcEmulated = formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
+                                 && !image->formatInfo()->flags.test(DxvkFormatFlag::BlockCompressed);
+            const bool snormRtEmulated = pTexture->IsRgba8SnormRtEmulated();
+            if (snormRtEmulated) {
+              if (!ConvertD3D11Rgba8SnormToRgba16Float(
+                    mipLevelExtent, uploadData, uploadRowPitch, uploadSlicePitch,
+                    converted))
+                throw DxvkError("WineHua: Failed to convert initial RGBA8 SNORM texture data");
+              uploadData = converted.data.data();
+              uploadRowPitch = converted.rowPitch;
+              uploadSlicePitch = converted.slicePitch;
+            } else if (bcEmulated) {
+              if (!DecodeD3D11BcImage(packedFormat, mipLevelExtent,
+                                      uploadData, uploadRowPitch, uploadSlicePitch,
+                                      converted))
+                throw DxvkError("WineHua: Failed to decompress initial BC texture data");
+              uploadData = converted.data.data();
+              uploadRowPitch = converted.rowPitch;
+              uploadSlicePitch = converted.slicePitch;
+            }
+
             m_transferCommands += 1;
-            m_transferMemory   += pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
+            m_transferMemory   += (snormRtEmulated || bcEmulated)
+                                ? converted.data.size()
+                                : pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
             
             VkImageSubresourceLayers subresourceLayers;
             subresourceLayers.aspectMask     = formatInfo->aspectMask;
@@ -150,9 +212,7 @@ namespace dxvk {
             if (formatInfo->aspectMask != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
               m_context->uploadImage(
                 image, subresourceLayers,
-                pInitialData[id].pSysMem,
-                pInitialData[id].SysMemPitch,
-                pInitialData[id].SysMemSlicePitch);
+                uploadData, uploadRowPitch, uploadSlicePitch);
             } else {
               m_context->updateDepthStencilImage(
                 image, subresourceLayers,
@@ -166,9 +226,26 @@ namespace dxvk {
           }
 
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_NONE) {
-            util::packImageData(pTexture->GetMappedBuffer(id)->mapPtr(0),
+            auto mappedBuffer = pTexture->GetMappedBuffer(id);
+            util::packImageData(mappedBuffer->mapPtr(0),
               pInitialData[id].pSysMem, pInitialData[id].SysMemPitch, pInitialData[id].SysMemSlicePitch,
               0, 0, pTexture->GetVkImageType(), mipLevelExtent, 1, formatInfo, formatInfo->aspectMask);
+            if (level == 0 && formatInfo->elementSize == 4
+             && !formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
+             && !formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+              winehuaTraceRgbaAlpha("init-packed",
+                mappedBuffer->mapPtr(0),
+                mipLevelExtent.width, mipLevelExtent.height,
+                uint64_t(mipLevelExtent.width) * formatInfo->elementSize,
+                uint32_t(packedFormat), id, layer);
+            }
+            if (winehuaFlushDynamicMapped()) {
+              if (mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_STAGING)
+                mappedBuffer->flushMappedSlice(mappedBuffer->getSliceHandle());
+              else
+                m_context->flushMappedBuffer(
+                  mappedBuffer, mappedBuffer->getSliceHandle());
+            }
           }
         }
       }
@@ -193,6 +270,12 @@ namespace dxvk {
         for (uint32_t i = 0; i < pTexture->CountSubresources(); i++) {
           auto buffer = pTexture->GetMappedBuffer(i);
           std::memset(buffer->mapPtr(0), 0, buffer->info().size);
+          if (winehuaFlushDynamicMapped()) {
+            if (mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_STAGING)
+              buffer->flushMappedSlice(buffer->getSliceHandle());
+            else
+              m_context->flushMappedBuffer(buffer, buffer->getSliceHandle());
+          }
         }
       }
     }

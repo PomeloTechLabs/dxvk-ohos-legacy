@@ -8,6 +8,11 @@ namespace dxvk {
 
   template <bool Register>
   static void RegisterUserDefinedAnnotation(IDXVKUserDefinedAnnotation* annotation) {
+    #if defined(DXVK_NATIVE_OHOS)
+    // D3D9's private annotation registration ABI is not present in a native
+    // OpenHarmony process. Vulkan debug labels remain available below.
+    return;
+    #else
     using RegistrationFunctionType = void(__stdcall *)(IDXVKUserDefinedAnnotation*);
     static const int16_t RegisterOrdinal = 28257;
     static const int16_t UnregisterOrdinal = 28258;
@@ -28,6 +33,7 @@ namespace dxvk {
     }
 
     registrationFunction(annotation);
+    #endif
   }
 
   D3D11UserDefinedAnnotation::D3D11UserDefinedAnnotation(D3D11DeviceContext* ctx)

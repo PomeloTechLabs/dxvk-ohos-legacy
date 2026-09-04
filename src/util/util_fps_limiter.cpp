@@ -137,6 +137,11 @@ namespace dxvk {
 
 
   void FpsLimiter::initialize() {
+#if defined(DXVK_NATIVE_OHOS)
+    // OpenHarmony has no ntdll timer APIs. Use the portable sleep path and
+    // retain a conservative one-millisecond scheduler granularity.
+    m_sleepGranularity = NtTimerDuration(10000);
+#else
     HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
 
     if (ntdll) {
@@ -163,6 +168,7 @@ namespace dxvk {
       // Assume 1ms sleep granularity by default
       m_sleepGranularity = NtTimerDuration(10000);
     }
+#endif
 
     m_sleepThreshold = 4 * m_sleepGranularity;
     m_lastFrame = dxvk::high_resolution_clock::now();

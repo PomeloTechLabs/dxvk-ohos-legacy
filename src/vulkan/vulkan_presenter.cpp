@@ -1,8 +1,22 @@
 #include "vulkan_presenter.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+#include <optional>
+#endif
+
 #include "../dxvk/dxvk_format.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk::vk {
+
+  template<typename T>
+  static uint64_t winehuaHandleValue(T handle) {
+#if VK_USE_64_BIT_PTR_DEFINES
+    return reinterpret_cast<uintptr_t>(handle);
+#else
+    return uint64_t(handle);
+#endif
+  }
 
   Presenter::Presenter(
           HWND            window,
@@ -14,16 +28,28 @@ namespace dxvk::vk {
     // As of Wine 5.9, winevulkan provides this extension, but does
     // not filter the pNext chain for VkSwapchainCreateInfoKHR properly
     // before passing it to the Linux sude, which breaks RenderDoc.
+    #if defined(DXVK_NATIVE_OHOS)
+    m_device.features.fullScreenExclusive = false;
+    m_nativeWindow = ohos::findWindow(reinterpret_cast<uintptr_t>(window));
+    #else
     if (m_device.features.fullScreenExclusive && ::GetModuleHandle("winevulkan.dll")) {
       Logger::warn("winevulkan detected, disabling exclusive fullscreen support");
       m_device.features.fullScreenExclusive = false;
     }
+    #endif
 
-    if (createSurface() != VK_SUCCESS)
-      throw DxvkError("Failed to create surface");
+    try {
+      if (createSurface() != VK_SUCCESS)
+        throw DxvkError("Failed to create surface");
 
-    if (recreateSwapChain(desc) != VK_SUCCESS)
-      throw DxvkError("Failed to create swap chain");
+      if (recreateSwapChain(desc) != VK_SUCCESS)
+        throw DxvkError("Failed to create swap chain");
+    } catch (...) {
+      // A throwing constructor has no destructor to clean partial WSI state.
+      destroySwapchain();
+      destroySurface();
+      throw;
+    }
   }
 
   
@@ -43,26 +69,65 @@ namespace dxvk::vk {
   }
 
 
-  VkResult Presenter::acquireNextImage(PresenterSync& sync, uint32_t& index) {
+  VkResult Presenter::acquireNextImage(PresenterSync& sync, uint32_t& index, bool nonBlocking) {
+    #if defined(DXVK_NATIVE_OHOS)
+    ohos::WindowLease lease(m_nativeWindow);
+    const auto windowStatus = checkNativeWindow(lease);
+    if (windowStatus != VK_SUCCESS)
+      return windowStatus;
+    #endif
+
     sync = m_semaphores.at(m_frameIndex);
 
     // Don't acquire more than one image at a time
     if (m_acquireStatus == VK_NOT_READY) {
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
-        m_swapchain, std::numeric_limits<uint64_t>::max(),
+        m_swapchain,
+        #if defined(DXVK_NATIVE_OHOS)
+        nonBlocking ? 0 : 16000000, // Finite waits allow surface retirement.
+        #else
+        std::numeric_limits<uint64_t>::max(),
+        #endif
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
     }
+
+    #if defined(DXVK_NATIVE_OHOS)
+    if (m_acquireStatus == VK_TIMEOUT || m_acquireStatus == VK_NOT_READY) {
+      const auto status = m_acquireStatus;
+      m_acquireStatus = VK_NOT_READY;
+      return status;
+    }
+    #endif
     
     if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
       return m_acquireStatus;
     
     index = m_imageIndex;
+    #if defined(DXVK_NATIVE_OHOS)
+    // Reacquiring an image orders reuse of that image's present semaphore.
+    // A CPU frame index is not sufficient to prove presentation completion.
+    sync.present = m_semaphores.at(m_imageIndex).present;
+    #endif
     return m_acquireStatus;
   }
 
 
   VkResult Presenter::presentImage() {
+    #if defined(DXVK_NATIVE_OHOS)
+    // This runs on the submission thread, so validate here, not only at the
+    // D3D11 entry point. Retirement waits for the actual Vulkan call to finish.
+    std::optional<ohos::WindowLease> lease(std::in_place, m_nativeWindow);
+    const auto windowStatus = checkNativeWindow(*lease);
+    if (windowStatus != VK_SUCCESS)
+      return windowStatus;
+    if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
+      return VK_NOT_READY;
+    #endif
+
     PresenterSync sync = m_semaphores.at(m_frameIndex);
+    #if defined(DXVK_NATIVE_OHOS)
+    sync.present = m_semaphores.at(m_imageIndex).present;
+    #endif
 
     VkPresentInfoKHR info;
     info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -76,19 +141,31 @@ namespace dxvk::vk {
 
     VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
 
+    #if defined(DXVK_NATIVE_OHOS)
+    // Never re-present an acquired image after an error. The frontend drains
+    // the GPU and recreates the swapchain for out-of-date/surface-lost errors.
+    m_acquireStatus = status < 0 ? status : VK_NOT_READY;
+    #endif
+
     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
       return status;
 
-    // Try to acquire next image already, in order to hide
-    // potential delays from the application thread.
     m_frameIndex += 1;
     m_frameIndex %= m_semaphores.size();
 
+    #if defined(DXVK_NATIVE_OHOS)
+    // Do not hold the lifecycle lease while throttling or pre-acquiring.
+    // Acquire is performed with a finite timeout at the next frame boundary.
+    lease.reset();
+    #else
+    // Try to acquire next image already, in order to hide
+    // potential delays from the application thread.
     sync = m_semaphores.at(m_frameIndex);
 
     m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
       m_swapchain, std::numeric_limits<uint64_t>::max(),
       sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+    #endif
 
     bool vsync = m_info.presentMode == VK_PRESENT_MODE_FIFO_KHR
               || m_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
@@ -99,8 +176,22 @@ namespace dxvk::vk {
 
   
   VkResult Presenter::recreateSwapChain(const PresenterDesc& desc) {
+    #if defined(DXVK_NATIVE_OHOS)
+    ohos::WindowLease lease(m_nativeWindow);
+    if (!lease.active())
+      return VK_ERROR_SURFACE_LOST_KHR;
+    #endif
+
     if (m_swapchain)
       destroySwapchain();
+
+    #if defined(DXVK_NATIVE_OHOS)
+    if (!lease.drawable()) {
+      m_info = { };
+      m_windowRevision = lease.revision();
+      return VK_SUCCESS;
+    }
+    #endif
 
     // Query surface capabilities. Some properties might
     // have changed, including the size limits and supported
@@ -117,7 +208,12 @@ namespace dxvk::vk {
         // Recreate the surface and try again.
         if (m_surface)
           destroySurface();
-        if ((status = createSurface()) != VK_SUCCESS)
+        #if defined(DXVK_NATIVE_OHOS)
+        status = createNativeSurface(lease.nativeWindow());
+        #else
+        status = createSurface();
+        #endif
+        if (status != VK_SUCCESS)
           return status;
         status = m_vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             m_device.adapter, m_surface, &caps);
@@ -132,11 +228,19 @@ namespace dxvk::vk {
     if ((status = getSupportedPresentModes(modes, desc)) != VK_SUCCESS)
       return status;
 
+    if (formats.empty() || modes.empty())
+      return VK_ERROR_INITIALIZATION_FAILED;
+
     // Select actual swap chain properties and create swap chain
     m_info.format       = pickFormat(formats.size(), formats.data(), desc.numFormats, desc.formats);
     m_info.presentMode  = pickPresentMode(modes.size(), modes.data(), desc.numPresentModes, desc.presentModes);
     m_info.imageExtent  = pickImageExtent(caps, desc.imageExtent);
     m_info.imageCount   = pickImageCount(caps, m_info.presentMode, desc.imageCount);
+
+    #if defined(DXVK_NATIVE_OHOS)
+    // XComponent dimensions are authoritative for a variable-size surface.
+    m_info.imageExtent = pickImageExtent(caps, { lease.width(), lease.height() });
+    #endif
 
     if (!m_info.imageExtent.width || !m_info.imageExtent.height) {
       m_info.imageCount = 0;
@@ -170,6 +274,20 @@ namespace dxvk::vk {
     swapInfo.clipped                = VK_TRUE;
     swapInfo.oldSwapchain           = VK_NULL_HANDLE;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    // The blitter needs color-attachment usage. Transfer-dst is optional here.
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    swapInfo.imageUsage &= caps.supportedUsageFlags;
+    swapInfo.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+      ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
+    if (!caps.supportedCompositeAlpha)
+      return VK_ERROR_INITIALIZATION_FAILED;
+    const auto alphaFlags = caps.supportedCompositeAlpha;
+    swapInfo.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(
+      alphaFlags & (~alphaFlags + 1u));
+    #endif
+
     if (m_device.features.fullScreenExclusive)
       swapInfo.pNext = &fullScreenInfo;
 
@@ -197,6 +315,14 @@ namespace dxvk::vk {
 
     for (uint32_t i = 0; i < m_info.imageCount; i++) {
       m_images[i].image = images[i];
+
+      if (winehuaPresentImageTraceEnabled()) {
+        Logger::info(str::format(
+          "WineHuaPresentImage: layer=dxvk event=image-map swapchain=0x",
+          std::hex, winehuaHandleValue(m_swapchain),
+          " index=", std::dec, i,
+          " image=0x", std::hex, winehuaHandleValue(images[i])));
+      }
 
       VkImageViewCreateInfo viewInfo;
       viewInfo.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -239,6 +365,9 @@ namespace dxvk::vk {
     m_imageIndex = 0;
     m_frameIndex = 0;
     m_acquireStatus = VK_NOT_READY;
+    #if defined(DXVK_NATIVE_OHOS)
+    m_windowRevision = lease.revision();
+    #endif
     return VK_SUCCESS;
   }
 
@@ -445,6 +574,10 @@ namespace dxvk::vk {
 
 
   VkResult Presenter::createSurface() {
+    #if defined(DXVK_NATIVE_OHOS)
+    ohos::WindowLease lease(m_nativeWindow);
+    return createNativeSurface(lease.nativeWindow());
+    #else
     HINSTANCE instance = reinterpret_cast<HINSTANCE>(
       GetWindowLongPtr(m_window, GWLP_HINSTANCE));
     
@@ -468,12 +601,50 @@ namespace dxvk::vk {
       return status;
     
     if (!supportStatus) {
-      m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);
+      destroySurface();
       return VK_ERROR_OUT_OF_HOST_MEMORY; // just abuse this
     }
 
     return VK_SUCCESS;
+    #endif
   }
+
+
+  #if defined(DXVK_NATIVE_OHOS)
+  VkResult Presenter::createNativeSurface(void* window) {
+    if (!window)
+      return VK_ERROR_SURFACE_LOST_KHR;
+    if (!m_vki->vkCreateSurfaceOHOS)
+      return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+    VkSurfaceCreateInfoOHOS info = { };
+    // VK_STRUCTURE_TYPE_SURFACE_CREATE_INFO_OHOS in the pinned NDK. The
+    // legacy core enum predates it; the SDK ABI test checks this value.
+    info.sType = static_cast<VkStructureType>(1000685000);
+    info.window = static_cast<OHNativeWindow*>(window);
+    auto status = m_vki->vkCreateSurfaceOHOS(m_vki->instance(), &info, nullptr, &m_surface);
+    if (status != VK_SUCCESS)
+      return status;
+
+    VkBool32 supported = VK_FALSE;
+    status = m_vki->vkGetPhysicalDeviceSurfaceSupportKHR(m_device.adapter,
+      m_device.queueFamily, m_surface, &supported);
+    if (status != VK_SUCCESS || !supported) {
+      destroySurface();
+      return status != VK_SUCCESS ? status : VK_ERROR_INITIALIZATION_FAILED;
+    }
+    return VK_SUCCESS;
+  }
+
+
+  VkResult Presenter::checkNativeWindow(const ohos::WindowLease& lease) const {
+    if (!lease.active())
+      return VK_ERROR_SURFACE_LOST_KHR;
+    if (!lease.drawable() || lease.revision() != m_windowRevision || !m_swapchain)
+      return VK_ERROR_OUT_OF_DATE_KHR;
+    return VK_SUCCESS;
+  }
+  #endif
 
 
   void Presenter::destroySwapchain() {
@@ -491,11 +662,15 @@ namespace dxvk::vk {
     m_semaphores.clear();
 
     m_swapchain = VK_NULL_HANDLE;
+    m_info.imageCount = 0;
+    m_acquireStatus = VK_NOT_READY;
   }
 
 
   void Presenter::destroySurface() {
-    m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);
+    if (m_surface)
+      m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);
+    m_surface = VK_NULL_HANDLE;
   }
 
 }

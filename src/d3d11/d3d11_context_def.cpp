@@ -1,5 +1,6 @@
 #include "d3d11_context_def.h"
 #include "d3d11_device.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -309,6 +310,8 @@ namespace dxvk {
       ] (DxvkContext* ctx) {
         DxvkBufferSliceHandle slice = cDstBuffer->allocSlice();
         std::memcpy(slice.mapPtr, cDataSlice.ptr(), cDataSlice.length());
+        if (winehuaFlushDynamicMapped())
+          ctx->flushMappedBuffer(cDstBuffer, slice);
         ctx->invalidateBuffer(cDstBuffer, slice);
       });
     }

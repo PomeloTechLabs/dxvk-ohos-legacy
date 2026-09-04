@@ -12,6 +12,7 @@ layout(push_constant)
 uniform present_info_t {
   ivec2 src_offset;
   uvec2 src_extent;
+  uint encode_srgb;
 };
 
 void main() {
@@ -24,5 +25,12 @@ void main() {
       texture(s_gamma, o_color.g).g,
       texture(s_gamma, o_color.b).b,
       o_color.a);
+  }
+
+  if (encode_srgb != 0u) {
+    vec3 linear = clamp(o_color.rgb, vec3(0.0f), vec3(1.0f));
+    vec3 low = linear * 12.92f;
+    vec3 high = 1.055f * pow(linear, vec3(1.0f / 2.4f)) - 0.055f;
+    o_color.rgb = mix(high, low, lessThanEqual(linear, vec3(0.0031308f)));
   }
 }

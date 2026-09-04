@@ -135,6 +135,13 @@ namespace dxvk::sync {
       });
     }
 
+    bool waitFor(uint64_t value, std::chrono::milliseconds timeout) {
+      std::unique_lock<dxvk::mutex> lock(m_mutex);
+      return m_cond.wait_for(lock, timeout, [this, value] {
+        return value <= m_value.load(std::memory_order_acquire);
+      });
+    }
+
     template<typename Fn>
     void setCallback(uint64_t value, Fn&& proc) {
       std::unique_lock<dxvk::mutex> lock(m_mutex);

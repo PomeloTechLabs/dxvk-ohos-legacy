@@ -2,6 +2,7 @@
 #include "d3d11_device.h"
 #include "d3d11_buffer.h"
 #include "d3d11_texture.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
     
@@ -68,6 +69,12 @@ namespace dxvk {
   
   
   uint64_t D3D11CommandList::EmitToCsThread(DxvkCsThread* CsThread) {
+    winehuaFlowTrace(str::format(
+      "d3d11-command-list emit chunks=", m_chunks.size(),
+      " queries=", m_queries.size(),
+      " resources=", m_resources.size(),
+      " submitted=", m_submitted.load(std::memory_order_relaxed) ? 1 : 0));
+
     uint64_t seq = 0;
 
     for (const auto& query : m_queries)

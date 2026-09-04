@@ -44,8 +44,29 @@ namespace dxvk {
     if (samplerInfo.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT)
       samplerInfo.pNext = &borderColorInfo;
 
-    if (m_vkd->vkCreateSampler(m_vkd->device(),
-        &samplerInfo, nullptr, &m_sampler) != VK_SUCCESS)
+    m_info = samplerInfo;
+    m_info.pNext = nullptr;
+    m_customBorderColor = info.borderColor;
+
+    const VkResult status = m_vkd->vkCreateSampler(
+      m_vkd->device(), &samplerInfo, nullptr, &m_sampler);
+
+    if (info.compareToDepth) {
+      Logger::info(str::format(
+        "WineHua: comparison-sampler host=", uintptr_t(m_sampler),
+        " compareEnable=", samplerInfo.compareEnable,
+        " compareOp=", samplerInfo.compareOp,
+        " minFilter=", samplerInfo.minFilter,
+        " magFilter=", samplerInfo.magFilter,
+        " mipmapMode=", samplerInfo.mipmapMode,
+        " address=", samplerInfo.addressModeU, ",",
+        samplerInfo.addressModeV, ",", samplerInfo.addressModeW,
+        " lod=", samplerInfo.minLod, "..", samplerInfo.maxLod,
+        " border=", samplerInfo.borderColor,
+        " status=", status));
+    }
+
+    if (status != VK_SUCCESS)
       throw DxvkError("DxvkSampler::DxvkSampler: Failed to create sampler");
   }
   
@@ -56,7 +77,9 @@ namespace dxvk {
   }
 
 
-  VkBorderColor DxvkSampler::getBorderColor(const Rc<DxvkDevice>& device, const DxvkSamplerCreateInfo& info) {
+  VkBorderColor DxvkSampler::getBorderColor(
+    const Rc<DxvkDevice>&        device,
+    const DxvkSamplerCreateInfo& info) {
     static const std::array<std::pair<VkClearColorValue, VkBorderColor>, 3> s_borderColors = {{
       { { { 0.0f, 0.0f, 0.0f, 0.0f } }, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK },
       { { { 0.0f, 0.0f, 0.0f, 1.0f } }, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK },
@@ -74,7 +97,6 @@ namespace dxvk {
     }
 
     if (!device->features().extCustomBorderColor.customBorderColorWithoutFormat) {
-      Logger::warn("DXVK: Custom border colors not supported");
       return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     }
 

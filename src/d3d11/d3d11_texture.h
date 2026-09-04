@@ -241,6 +241,21 @@ namespace dxvk {
     VkFormat GetPackedFormat() const {
       return m_packedFormat;
     }
+
+    /**
+     * \brief Tests whether RGBA8 SNORM render-target storage is emulated
+     *
+     * WineHua can keep the D3D-visible R8G8B8A8_SNORM contract while using
+     * an RGBA16F Vulkan image on devices that cannot render to SNORM images.
+     */
+    bool IsRgba8SnormRtEmulated() const {
+      return m_rgba8SnormRtEmulated;
+    }
+
+    /**
+     * \brief Resolves the physical Vulkan format for a logical D3D view
+     */
+    VkFormat GetViewFormat(DXGI_FORMAT Format) const;
     
     /**
      * \brief Checks whether the resource is eligible for tracking
@@ -391,6 +406,7 @@ namespace dxvk {
     D3D11_COMMON_TEXTURE_MAP_MODE m_mapMode;
     DXGI_USAGE                    m_dxgiUsage;
     VkFormat                      m_packedFormat;
+    bool                          m_rgba8SnormRtEmulated = false;
     
     Rc<DxvkImage>                 m_image;
     std::vector<MappedBuffer>     m_buffers;

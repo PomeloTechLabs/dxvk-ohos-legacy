@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "dxvk_include.h"
+#include "dxvk_bind_mask.h"
 #include "dxvk_limits.h"
 #include "dxvk_pipelayout.h"
 #include "dxvk_shader_key.h"
@@ -14,6 +15,38 @@ namespace dxvk {
   
   class DxvkShader;
   class DxvkShaderModule;
+  class DxvkDevice;
+
+  /**
+   * \\brief Selects the WineHua bool-specialization workaround.
+   *
+   * The default is capability/adapter based.  DXVK_WINEHUA_FREEZE_BOOL_SPEC
+   * remains an explicit debug override (0/1), while WINEHUA_DXVK_QUIRKS can
+   * force the named quirk for a new Venus implementation before its adapter
+   * name is added to the automatic policy.
+   */
+  bool dxvkWineHuaFreezeBoolSpec(const DxvkDevice* device);
+
+  /**
+   * \brief Selects the single-sample alpha-to-coverage workaround
+   *
+   * Some Maleoon Vulkan drivers accept alpha-to-coverage with one raster
+   * sample but leave the coverage mask unchanged. D3D applications commonly
+   * rely on fully transparent texels producing no coverage even in this
+   * configuration. The environment override keeps the workaround reversible
+   * while the automatic policy remains scoped to the affected adapter.
+   */
+  bool dxvkWineHuaEmulateSingleSampleA2C(const DxvkDevice* device);
+
+  /**
+   * \brief Returns an optional low-alpha discard threshold for single-sample A2C
+   *
+   * The default is zero, preserving every non-zero alpha value. A tiny
+   * threshold can be enabled for drivers that leave quantization noise in
+   * nominally transparent texels. The value is supplied through
+   * DXVK_WINEHUA_SINGLE_SAMPLE_A2C_EPSILON and is clamped by the runtime.
+   */
+  float dxvkWineHuaSingleSampleA2CEpsilon(const DxvkDevice* device);
   
   /**
    * \brief Built-in specialization constants
@@ -31,7 +64,14 @@ namespace dxvk {
     // Specialization constants for pipeline state
     SpecConstantRangeStart      = ColorComponentMappings + MaxNumRenderTargets,
     RasterizerSampleCount       = SpecConstantRangeStart + 0,
-    FirstPipelineConstant
+    /* Keep FirstPipelineConstant at its upstream value.  The built-in
+     * present/HUD shaders use this ID for their first user specialization
+     * constant (1225 on the legacy branch).  WineHua compatibility constants
+     * must live after the complete user specialization range, otherwise those
+     * shaders silently receive the A2C flag instead of their intended value. */
+    FirstPipelineConstant,
+    AlphaToCoverageSingleSample = FirstPipelineConstant + MaxNumSpecConstants,
+    AlphaToCoverageSingleSampleEpsilon = AlphaToCoverageSingleSample + 1
   };
 
   /**
@@ -79,6 +119,10 @@ namespace dxvk {
    */
   struct DxvkShaderModuleCreateInfo {
     bool      fsDualSrcBlend  = false;
+    bool      fsSecondaryOutput = false;
+    bool      freezeBoolSpec  = false;
+    const DxvkBindingMask* boolSpecMask = nullptr;
+    uint32_t  boolSpecCount   = 0;
     uint32_t  undefinedInputs = 0;
   };
   
@@ -207,6 +251,7 @@ namespace dxvk {
     DxvkShaderKey                 m_key;
     size_t                        m_hash = 0;
 
+    size_t                        m_o0LocOffset = 0;
     size_t                        m_o1IdxOffset = 0;
     size_t                        m_o1LocOffset = 0;
 
@@ -256,6 +301,10 @@ namespace dxvk {
       stage.pSpecializationInfo = specInfo;
       return stage;
     }
+
+    const std::string& winehuaVariantId() const {
+      return m_winehuaVariantId;
+    }
     
     /**
      * \brief Checks whether module is valid
@@ -269,6 +318,7 @@ namespace dxvk {
     
     Rc<vk::DeviceFn>                m_vkd;
     VkPipelineShaderStageCreateInfo m_stage;
+    std::string                     m_winehuaVariantId;
     
   };
   

@@ -14,6 +14,7 @@
 #include "dxvk_signal.h"
 #include "dxvk_staging.h"
 #include "dxvk_stats.h"
+#include "dxvk_winehua_trace.h"
 
 namespace dxvk {
   
@@ -94,6 +95,10 @@ namespace dxvk {
     VkResult submit(
             VkSemaphore     waitSemaphore,
             VkSemaphore     wakeSemaphore);
+
+    VkResult queueWineHuaMappedFlush(
+            Rc<DxvkResource>          resource,
+      const VkMappedMemoryRange&      range);
     
     /**
      * \brief Synchronizes command buffer execution
@@ -782,14 +787,62 @@ namespace dxvk {
 
     void cmdInsertDebugUtilsLabel(VkDebugUtilsLabelEXT *pLabelInfo);
 
+    /**
+     * \brief Returns the execution command buffer for opt-in WineHua tracing
+     *
+     * This is diagnostic identity only. It must never be used to change
+     * command recording, submission, or lifetime behavior.
+     */
+    VkCommandBuffer winehuaExecBuffer() const {
+      return m_execBuffer;
+    }
+
+    void winehuaTracePresentCopy(
+            uint64_t              frameId,
+            uint32_t              destinationIndex,
+            VkImage               sourceImage,
+            VkImage               destinationImage,
+            VkSampleCountFlagBits sourceSamples) {
+      m_winehuaPresentCopyValid = true;
+      m_winehuaPresentCopyFrame = frameId;
+      m_winehuaPresentCopyDestinationIndex = destinationIndex;
+      m_winehuaPresentCopySourceImage = sourceImage;
+      m_winehuaPresentCopyDestinationImage = destinationImage;
+      m_winehuaPresentCopySourceSamples = sourceSamples;
+    }
+
+    void winehuaTraceFrame(uint64_t frameId) {
+      if (m_winehuaFrames.empty() || m_winehuaFrames.back() != frameId)
+        m_winehuaFrames.push_back(frameId);
+    }
+
+    uint64_t winehuaRecordingId() const {
+      return m_winehuaRecordingId;
+    }
+
     void resetQuery(
             VkQueryPool             queryPool,
             uint32_t                queryId) {
-      m_vkd->vkResetQueryPoolEXT(
-        m_vkd->device(), queryPool, queryId, 1);
+      if (winehuaCommandQueryReset()) {
+        winehuaQueryTrace(str::format(
+          "reset mode=command pool=", queryPool, " id=", queryId));
+        m_cmdBuffersUsed.set(DxvkCmdBuffer::InitBuffer);
+        m_vkd->vkCmdResetQueryPool(
+          m_initBuffer, queryPool, queryId, 1);
+      } else {
+        winehuaQueryTrace(str::format(
+          "reset mode=host pool=", queryPool, " id=", queryId));
+        m_vkd->vkResetQueryPoolEXT(
+          m_vkd->device(), queryPool, queryId, 1);
+      }
     }
 
   private:
+
+    struct WineHuaMappedFlush {
+      Rc<DxvkResource>     resource;
+      VkMappedMemoryRange range;
+    };
     
     DxvkDevice*         m_device;
     Rc<vk::DeviceFn>    m_vkd;
@@ -816,6 +869,17 @@ namespace dxvk {
     DxvkStatCounters    m_statCounters;
     DxvkQueueSubmission m_submission;
 
+    std::vector<WineHuaMappedFlush> m_winehuaMappedFlushes;
+
+    uint64_t             m_winehuaRecordingId = 0;
+    std::vector<uint64_t> m_winehuaFrames;
+    bool                 m_winehuaPresentCopyValid = false;
+    uint64_t             m_winehuaPresentCopyFrame = 0;
+    uint32_t             m_winehuaPresentCopyDestinationIndex = 0;
+    VkImage              m_winehuaPresentCopySourceImage = VK_NULL_HANDLE;
+    VkImage              m_winehuaPresentCopyDestinationImage = VK_NULL_HANDLE;
+    VkSampleCountFlagBits m_winehuaPresentCopySourceSamples = VK_SAMPLE_COUNT_1_BIT;
+
     std::vector<DxvkFenceValuePair> m_waitSemaphores;
     std::vector<DxvkFenceValuePair> m_signalSemaphores;
 
@@ -830,6 +894,8 @@ namespace dxvk {
             VkQueue               queue,
             VkFence               fence,
       const DxvkQueueSubmission&  info);
+
+    VkResult flushWineHuaMappedFlushes();
     
   };
   

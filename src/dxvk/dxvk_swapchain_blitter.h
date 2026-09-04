@@ -67,6 +67,7 @@ namespace dxvk {
         VkExtent2D srcExtent;
         VkOffset2D dstOffset;
       };
+      uint32_t encodeSrgb;
     };
 
     Rc<DxvkDevice>      m_device;

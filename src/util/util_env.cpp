@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <numeric>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(DXVK_NATIVE_OHOS)
 #include <unistd.h>
 #include <limits.h>
 #endif
@@ -79,12 +79,16 @@ namespace dxvk::env {
     exePath.resize(len);
 
     return str::fromws(exePath.data());
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(DXVK_NATIVE_OHOS)
     std::array<char, PATH_MAX> exePath = {};
 
-    size_t count = readlink("/proc/self/exe", exePath.data(), exePath.size());
+    const ssize_t count = readlink("/proc/self/exe", exePath.data(), exePath.size());
 
-    return std::string(exePath.begin(), exePath.begin() + count);
+    return count > 0
+      ? std::string(exePath.data(), static_cast<size_t>(count))
+      : std::string();
+#else
+    return std::string();
 #endif
   }
   
@@ -115,7 +119,17 @@ namespace dxvk::env {
     str::tows(path.c_str(), widePath);
     return !!CreateDirectoryW(widePath, nullptr);
 #else
-    return std::filesystem::create_directories(path);
+    // DXVK treats the state-cache path as optional. On OHOS, unlike Win32
+    // CreateDirectoryW, std::filesystem throws for an empty path, so avoid
+    // making device creation depend on an optional cache directory.
+    if (path.empty())
+      return false;
+
+    std::error_code error;
+    if (std::filesystem::create_directories(path, error))
+      return true;
+
+    return !error && std::filesystem::is_directory(path, error);
 #endif
   }
   

@@ -1,10 +1,52 @@
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
+#include "d3d11_bc.h"
 #include "d3d11_device.h"
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
+#include "../dxvk/dxvk_winehua_trace.h"
 #include "../util/util_shared_res.h"
 
 namespace dxvk {
+
+  static bool winehuaFormatTraceEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_WINEHUA_TRACE_FORMATS");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  static bool winehuaFormatTraceAllow() {
+    if (!winehuaFormatTraceEnabled())
+      return false;
+
+    static std::atomic<uint32_t> emitted { 0 };
+    const uint32_t index = emitted.fetch_add(1, std::memory_order_relaxed);
+    if (index < 256)
+      return true;
+    if (index == 256)
+      Logger::info("WineHuaFormat: further records suppressed");
+    return false;
+  }
+
+  static bool winehuaRgba8SnormRtEmulationEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_WINEHUA_EMULATE_RGBA8_SNORM_RT");
+      #if defined(DXVK_NATIVE_OHOS)
+      // Native has no Wine launcher to supply the compatibility defaults.
+      // The actual remap remains conditional on missing attachment support.
+      if (!value) return true;
+      #endif
+      return value && (!std::strcmp(value, "1")
+                    || !std::strcmp(value, "on")
+                    || !std::strcmp(value, "auto"));
+    }();
+    return enabled;
+  }
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -45,6 +87,10 @@ namespace dxvk {
     if (hSharedHandle == nullptr)
       hSharedHandle = INVALID_HANDLE_VALUE;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    if (m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
+      Logger::warn("D3D11 shared texture handles are unavailable in native OpenHarmony mode.");
+    #else
     if (m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) {
       if (m_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
         Logger::warn("D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX: not supported.");
@@ -56,6 +102,7 @@ namespace dxvk {
         : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
       imageInfo.sharing.handle = hSharedHandle;
     }
+    #endif
 
     if (!pDevice->GetOptions()->disableMsaa)
       DecodeSampleCount(m_desc.SampleDesc.Count, &imageInfo.sampleCount);
@@ -71,6 +118,9 @@ namespace dxvk {
     // by a view with a different format. Depth-stencil formats cannot
     // be reinterpreted in Vulkan, so we'll ignore those.
     auto formatProperties = imageFormatInfo(formatInfo.Format);
+    auto packedProperties = imageFormatInfo(m_packedFormat);
+    const bool isBcEmulated = packedProperties->flags.test(DxvkFormatFlag::BlockCompressed)
+                           && !formatProperties->flags.test(DxvkFormatFlag::BlockCompressed);
     
     bool isMutable = formatFamily.FormatCount > 1;
     bool isMultiPlane = (formatProperties->aspectMask & VK_IMAGE_ASPECT_PLANE_0_BIT) != 0;
@@ -154,6 +204,20 @@ namespace dxvk {
     
     // Determine map mode based on our findings
     m_mapMode = DetermineMapMode(&imageInfo);
+
+    // The backing image contains decoded pixels, so CPU mapping or output
+    // binding would expose a layout that does not match the D3D-visible BC
+    // contract. Keep these paths unavailable until a bidirectional codec is
+    // present.
+    if (isBcEmulated
+     && (m_mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_NONE
+      || (m_desc.BindFlags & (D3D11_BIND_RENDER_TARGET
+                            | D3D11_BIND_DEPTH_STENCIL
+                            | D3D11_BIND_UNORDERED_ACCESS))
+      || (m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED
+                            | D3D11_RESOURCE_MISC_SHARED_NTHANDLE)))) {
+      throw DxvkError("WineHua: BC emulation supports device-local sampled textures only");
+    }
     
     // If the image is mapped directly to host memory, we need
     // to enable linear tiling, and DXVK needs to be aware that
@@ -185,14 +249,66 @@ namespace dxvk {
     if (imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && !isMultiPlane && imageInfo.sharing.mode == DxvkSharedHandleMode::None)
       imageInfo.layout = OptimizeLayout(imageInfo.usage);
 
+    /* Diagnostic A/B only. Keep the image and descriptor layout consistent
+     * while testing whether the Harmony Venus path treats GENERAL differently
+     * from SHADER_READ_ONLY_OPTIMAL. */
+    if (winehuaForceSampledGeneral()
+     && (imageInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+      imageInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+
     // For some formats, we need to enable sampled and/or
     // render target capabilities if available, but these
     // should in no way affect the default image layout
     imageInfo.usage |= EnableMetaCopyUsage(imageInfo.format, imageInfo.tiling);
     imageInfo.usage |= EnableMetaPackUsage(imageInfo.format, m_desc.CPUAccessFlags);
     
-    // Check if we can actually create the image
-    if (!CheckImageSupport(&imageInfo, imageInfo.tiling)) {
+    // Check if we can actually create the image. Maleoon exposes sampled
+    // R8G8B8A8_SNORM images but not color attachments. For opt-in A/B testing,
+    // keep the D3D format contract and use a renderable floating-point image
+    // that preserves negative values. This is deliberately resource-local;
+    // format capability queries remain truthful and buffers are unaffected.
+    bool imageSupported = CheckImageSupport(&imageInfo, imageInfo.tiling);
+
+    const bool canEmulateRgba8SnormRt =
+         winehuaRgba8SnormRtEmulationEnabled()
+      && m_desc.Format == DXGI_FORMAT_R8G8B8A8_SNORM
+      && m_dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+      && m_desc.Usage == D3D11_USAGE_DEFAULT
+      && m_desc.CPUAccessFlags == 0
+      && (m_desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+      && !(m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+      && !(m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED
+                             | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+                             | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
+      && vkImage == VK_NULL_HANDLE
+      && !imageInfo.shared;
+
+    if (!imageSupported && canEmulateRgba8SnormRt) {
+      DxvkImageCreateInfo emulatedInfo = imageInfo;
+      emulatedInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+      emulatedInfo.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      emulatedInfo.viewFormatCount = 0;
+      emulatedInfo.viewFormats = nullptr;
+      emulatedInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+
+      imageSupported = CheckImageSupport(&emulatedInfo, emulatedInfo.tiling);
+      if (!imageSupported) {
+        emulatedInfo.tiling = VK_IMAGE_TILING_LINEAR;
+        imageSupported = CheckImageSupport(&emulatedInfo, emulatedInfo.tiling);
+      }
+
+      if (imageSupported) {
+        imageInfo = emulatedInfo;
+        m_rgba8SnormRtEmulated = true;
+
+        static std::atomic<bool> reported { false };
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+          Logger::info("WineHuaFormat: emulating DXGI_FORMAT_R8G8B8A8_SNORM render targets with VK_FORMAT_R16G16B16A16_SFLOAT");
+        }
+      }
+    }
+
+    if (!imageSupported) {
       throw DxvkError(str::format(
         "D3D11: Cannot create texture:",
         "\n  Format:  ", m_desc.Format,
@@ -331,6 +447,14 @@ namespace dxvk {
     
     return DXGI_VK_FORMAT_MODE_ANY;
   }
+
+
+  VkFormat D3D11CommonTexture::GetViewFormat(DXGI_FORMAT Format) const {
+    if (m_rgba8SnormRtEmulated && Format == DXGI_FORMAT_R8G8B8A8_SNORM)
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    return m_device->LookupFormat(Format, GetFormatMode()).Format;
+  }
   
   
   uint32_t D3D11CommonTexture::GetPlaneCount() const {
@@ -344,6 +468,9 @@ namespace dxvk {
     // Check whether the given bind flags are supported
     if ((m_desc.BindFlags & BindFlags) != BindFlags)
       return false;
+
+    if (m_rgba8SnormRtEmulated)
+      return Format == DXGI_FORMAT_R8G8B8A8_SNORM && Plane == 0;
 
     // Check whether the view format is compatible
     DXGI_VK_FORMAT_MODE formatMode = GetFormatMode();
@@ -455,6 +582,59 @@ namespace dxvk {
     VkResult status = adapter->imageFormatProperties(
       pImageInfo->format, pImageInfo->type, Tiling,
       usage, pImageInfo->flags, formatProps);
+
+    const bool traceImageQuery = winehuaFormatTraceAllow();
+
+    if (traceImageQuery) {
+      const VkFormatProperties features = adapter->formatProperties(pImageInfo->format);
+      Logger::info(str::format(
+        "WineHuaFormat: image-query format=", uint32_t(pImageInfo->format),
+        " type=", uint32_t(pImageInfo->type),
+        " tiling=", uint32_t(Tiling),
+        " usage=0x", std::hex, uint32_t(usage),
+        " flags=0x", uint32_t(pImageInfo->flags), std::dec,
+        " status=", int32_t(status),
+        " linear-features=0x", std::hex, uint32_t(features.linearTilingFeatures),
+        " optimal-features=0x", uint32_t(features.optimalTilingFeatures), std::dec,
+        " requested-extent=", pImageInfo->extent.width,
+        "x", pImageInfo->extent.height,
+        "x", pImageInfo->extent.depth,
+        " max-extent=", formatProps.maxExtent.width,
+        "x", formatProps.maxExtent.height,
+        "x", formatProps.maxExtent.depth,
+        " samples=0x", std::hex, uint32_t(formatProps.sampleCounts), std::dec));
+
+      if (pImageInfo->format == VK_FORMAT_R8G8B8A8_SNORM) {
+        struct Candidate {
+          VkFormat format;
+          const char* name;
+        };
+        const Candidate candidates[] = {
+          { VK_FORMAT_R8G8B8A8_SNORM,       "R8G8B8A8_SNORM"       },
+          { VK_FORMAT_R8G8B8A8_UNORM,       "R8G8B8A8_UNORM"       },
+          { VK_FORMAT_R16G16B16A16_SNORM,   "R16G16B16A16_SNORM"   },
+          { VK_FORMAT_R16G16B16A16_SFLOAT,  "R16G16B16A16_SFLOAT"  },
+        };
+
+        for (const auto& candidate : candidates) {
+          VkImageFormatProperties candidateProps = { };
+          const VkResult candidateStatus = adapter->imageFormatProperties(
+            candidate.format, pImageInfo->type, Tiling,
+            usage, pImageInfo->flags, candidateProps);
+          const VkFormatProperties candidateFeatures = adapter->formatProperties(candidate.format);
+          Logger::info(str::format(
+            "WineHuaFormat: snorm-candidate name=", candidate.name,
+            " format=", uint32_t(candidate.format),
+            " status=", int32_t(candidateStatus),
+            " linear-features=0x", std::hex, uint32_t(candidateFeatures.linearTilingFeatures),
+            " optimal-features=0x", uint32_t(candidateFeatures.optimalTilingFeatures), std::dec,
+            " max-extent=", candidateProps.maxExtent.width,
+            "x", candidateProps.maxExtent.height,
+            "x", candidateProps.maxExtent.depth,
+            " samples=0x", std::hex, uint32_t(candidateProps.sampleCounts), std::dec));
+        }
+      }
+    }
     
     if (status != VK_SUCCESS)
       return FALSE;
@@ -602,6 +782,10 @@ namespace dxvk {
   
   
   void D3D11CommonTexture::ExportImageInfo() {
+    #if defined(DXVK_NATIVE_OHOS)
+    Logger::warn("D3D11: ExportImageInfo: cross-process shared resources are unavailable in native OpenHarmony mode.");
+    return;
+    #else
     HANDLE hSharedHandle;
 
     if (m_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED)
@@ -629,6 +813,7 @@ namespace dxvk {
 
     if (hSharedHandle != INVALID_HANDLE_VALUE)
       CloseHandle(hSharedHandle);
+    #endif
   }
   
   
@@ -862,19 +1047,29 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11DXGISurface::GetDC(
           BOOL                    Discard,
           HDC*                    phdc) {
+    #if defined(DXVK_NATIVE_OHOS)
+    if (phdc)
+      *phdc = nullptr;
+    return E_NOTIMPL;
+    #else
     if (!m_gdiSurface)
       return DXGI_ERROR_INVALID_CALL;
     
     return m_gdiSurface->Acquire(Discard, phdc);
+    #endif
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D11DXGISurface::ReleaseDC(
           RECT*                   pDirtyRect) {
+    #if defined(DXVK_NATIVE_OHOS)
+    return E_NOTIMPL;
+    #else
     if (!m_gdiSurface)
       return DXGI_ERROR_INVALID_CALL;
 
     return m_gdiSurface->Release(pDirtyRect);
+    #endif
   }
 
   
@@ -1358,6 +1553,9 @@ namespace dxvk {
   
   
   D3D11CommonTexture* GetCommonTexture(ID3D11Resource* pResource) {
+    if (!pResource)
+      return nullptr;
+
     D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     pResource->GetType(&dimension);
     

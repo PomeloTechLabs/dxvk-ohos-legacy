@@ -77,16 +77,19 @@
 #define D3DPRESENT_FORCEIMMEDIATE              0x00000100L
 #endif
 
-// MinGW headers are broken. Who'dve guessed?
-#ifndef _MSC_VER
+/* Older MinGW headers lacked D3DDEVINFO_RESOURCEMANAGER.  The current
+ * WineHua toolchain provides the type in d3d9types.h; keep the fallback only
+ * for non-MinGW cross headers so it cannot collide with the system typedef. */
+#if !defined(_MSC_VER) && !defined(__MINGW32__)
 typedef struct _D3DDEVINFO_RESOURCEMANAGER
 {
   char dummy;
 } D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
 
+#endif
+
 #ifndef __WINE__
 extern "C" WINUSERAPI WINBOOL WINAPI SetProcessDPIAware(VOID);
-#endif
 #endif
 
 // This is the managed pool on D3D9Ex, it's just hidden!

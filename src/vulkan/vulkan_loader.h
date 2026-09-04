@@ -4,7 +4,15 @@
 #include "../util/rc/util_rc_ptr.h"
 
 #define VK_USE_PLATFORM_WIN32_KHR 1
+#if defined(DXVK_NATIVE_OHOS)
+#define VK_USE_PLATFORM_OHOS 1
+#endif
 #include <vulkan/vulkan.h>
+#if defined(DXVK_NATIVE_OHOS)
+// Legacy's bundled vulkan.h predates OHOS; use the pinned NDK extension
+// declarations without replacing/upgrading the Vulkan core headers.
+#include <vulkan/vulkan_ohos.h>
+#endif
 
 #define VULKAN_FN(name) \
   ::PFN_ ## name name = reinterpret_cast<::PFN_ ## name>(sym(#name))
@@ -125,6 +133,10 @@ namespace dxvk::vk {
     #ifdef VK_USE_PLATFORM_WIN32_KHR
     VULKAN_FN(vkCreateWin32SurfaceKHR);
     VULKAN_FN(vkGetPhysicalDeviceWin32PresentationSupportKHR);
+    #endif
+
+    #if defined(DXVK_NATIVE_OHOS)
+    VULKAN_FN(vkCreateSurfaceOHOS);
     #endif
     
     VULKAN_FN(vkDestroySurfaceKHR);

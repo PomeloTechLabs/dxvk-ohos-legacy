@@ -3,6 +3,20 @@
 
 namespace dxvk {
 
+#if defined(DXVK_NATIVE_OHOS)
+
+  NTSTATUS D3DKMTCreateDCFromMemory(D3DKMT_CREATEDCFROMMEMORY*) {
+    Logger::warn("D3DKMTCreateDCFromMemory: unavailable in native OpenHarmony mode.");
+    return -1;
+  }
+
+  NTSTATUS D3DKMTDestroyDCFromMemory(D3DKMT_DESTROYDCFROMMEMORY*) {
+    Logger::warn("D3DKMTDestroyDCFromMemory: unavailable in native OpenHarmony mode.");
+    return -1;
+  }
+
+#else
+
   HMODULE GetGDIModule() {
     static HMODULE module = LoadLibraryA("gdi32.dll");
     return module;
@@ -29,5 +43,7 @@ namespace dxvk {
     Logger::warn("D3DKMTDestroyDCFromMemory: Unable to query proc address.");
     return -1;
   }
+
+#endif
 
 }

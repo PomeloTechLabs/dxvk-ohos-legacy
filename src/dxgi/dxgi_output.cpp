@@ -118,6 +118,10 @@ namespace dxvk {
     if (pModeToMatch->Format == DXGI_FORMAT_UNKNOWN && !pConcernedDevice)
       return DXGI_ERROR_INVALID_CALL;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    #else
+
     // Both or neither must be zero
     if ((pModeToMatch->Width == 0) ^ (pModeToMatch->Height == 0))
       return DXGI_ERROR_INVALID_CALL;
@@ -195,6 +199,7 @@ namespace dxvk {
         pClosestMatch->Width, "x", pClosestMatch->Height, "@",
         pClosestMatch->RefreshRate.Denominator ? (pClosestMatch->RefreshRate.Numerator / pClosestMatch->RefreshRate.Denominator) : 0));
     return S_OK;
+    #endif
   }
 
 
@@ -221,6 +226,10 @@ namespace dxvk {
           DXGI_OUTPUT_DESC1*    pDesc) {
     if (pDesc == nullptr)
       return DXGI_ERROR_INVALID_CALL;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    #else
     
     ::MONITORINFOEXW monInfo;
     monInfo.cbSize = sizeof(monInfo);
@@ -251,6 +260,7 @@ namespace dxvk {
     pDesc->MaxLuminance       = 0.0f;
     pDesc->MaxFullFrameLuminance = 0.0f;
     return S_OK;
+    #endif
   }
 
 
@@ -291,6 +301,11 @@ namespace dxvk {
           DXGI_MODE_DESC1*      pDesc) {
     if (pNumModes == nullptr)
       return DXGI_ERROR_INVALID_CALL;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    *pNumModes = 0;
+    return EnumFormat == DXGI_FORMAT_UNKNOWN ? S_OK : DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    #else
     
     // Special case, just return zero modes
     if (EnumFormat == DXGI_FORMAT_UNKNOWN) {
@@ -358,6 +373,7 @@ namespace dxvk {
     
     *pNumModes = dstModeId;
     return S_OK;
+    #endif
   }
 
 

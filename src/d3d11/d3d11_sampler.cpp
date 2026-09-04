@@ -1,8 +1,30 @@
+#include <array>
+#include <cstring>
+
 #include "d3d11_device.h"
 #include "d3d11_sampler.h"
 #include "d3d11_util.h"
 
 namespace dxvk {
+
+  static bool IsStandardBorderColor(
+    const D3D11_SAMPLER_DESC& desc,
+          bool                compareToDepth) {
+    const size_t componentCount = compareToDepth ? 1 : 4;
+    const std::array<std::array<float, 4>, 3> standardColors = {{
+      {{ 0.0f, 0.0f, 0.0f, 0.0f }},
+      {{ 0.0f, 0.0f, 0.0f, 1.0f }},
+      {{ 1.0f, 1.0f, 1.0f, 1.0f }},
+    }};
+
+    for (const auto& color : standardColors) {
+      if (!std::memcmp(desc.BorderColor, color.data(),
+          componentCount * sizeof(float)))
+        return true;
+    }
+
+    return false;
+  }
   
   D3D11SamplerState::D3D11SamplerState(
           D3D11Device*        device,
@@ -50,6 +72,56 @@ namespace dxvk {
     if (samplerAnisotropyOption >= 0 && info.minFilter == VK_FILTER_LINEAR) {
       info.useAnisotropy = samplerAnisotropyOption > 0;
       info.maxAnisotropy = float(samplerAnisotropyOption);
+    }
+
+    const bool usesBorder = desc.AddressU == D3D11_TEXTURE_ADDRESS_BORDER
+                         || desc.AddressV == D3D11_TEXTURE_ADDRESS_BORDER
+                         || desc.AddressW == D3D11_TEXTURE_ADDRESS_BORDER;
+
+    if (usesBorder) {
+      const bool isStandard = IsStandardBorderColor(desc, info.compareToDepth);
+      const bool hasNativeCustomBorder = device->GetDXVKDevice()->features()
+        .extCustomBorderColor.customBorderColorWithoutFormat;
+      const char* path = "standard";
+      const char* reason = "vulkan-standard-color";
+
+      if (!isStandard && hasNativeCustomBorder) {
+        path = "native";
+        reason = "VK_EXT_custom_border_color";
+      } else if (!isStandard) {
+        for (uint32_t i = 0; i < 4; i++)
+          m_emulationData.borderColor[i] = desc.BorderColor[i];
+
+        m_emulationData.metadata[1] = desc.AddressU == D3D11_TEXTURE_ADDRESS_BORDER;
+        m_emulationData.metadata[2] = desc.AddressV == D3D11_TEXTURE_ADDRESS_BORDER;
+        m_emulationData.metadata[3] = desc.AddressW == D3D11_TEXTURE_ADDRESS_BORDER;
+
+        if (info.compareToDepth) {
+          path = "unsupported";
+          reason = "comparison-sampler";
+        } else if (info.useAnisotropy) {
+          path = "unsupported";
+          reason = "anisotropic-filter";
+        } else if (info.minFilter != info.magFilter) {
+          path = "unsupported";
+          reason = "mixed-min-mag-filter";
+        } else {
+          path = "emulated";
+          reason = "sample-level-lod0";
+          m_emulationData.metadata[0] = info.minFilter == VK_FILTER_NEAREST
+            ? 1.0f
+            : 2.0f;
+        }
+      }
+
+      Logger::info(str::format(
+        "WineHua: custom-border path=", path,
+        " reason=", reason,
+        " rgba=", desc.BorderColor[0], ",", desc.BorderColor[1], ",",
+        desc.BorderColor[2], ",", desc.BorderColor[3],
+        " axes=", desc.AddressU == D3D11_TEXTURE_ADDRESS_BORDER ? "U" : "-",
+        desc.AddressV == D3D11_TEXTURE_ADDRESS_BORDER ? "V" : "-",
+        desc.AddressW == D3D11_TEXTURE_ADDRESS_BORDER ? "W" : "-"));
     }
     
     m_sampler = device->GetDXVKDevice()->createSampler(info);

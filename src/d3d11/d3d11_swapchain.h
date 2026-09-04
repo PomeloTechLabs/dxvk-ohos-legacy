@@ -114,16 +114,21 @@ namespace dxvk {
 
     double                  m_displayRefreshRate = 0.0;
 
-    HRESULT PresentImage(UINT SyncInterval);
+    HRESULT PresentImage(UINT SyncInterval, UINT PresentFlags);
+
+    #if defined(DXVK_NATIVE_OHOS)
+    HRESULT WaitForNativeFrame(uint64_t frame, bool nonBlocking);
+    #endif
 
     void SubmitPresent(
             D3D11ImmediateContext*  pContext,
       const vk::PresenterSync&      Sync,
-            uint32_t                FrameId);
+            uint32_t                FrameId,
+            uint64_t                NextFrameId);
 
-    void SynchronizePresent();
+    VkResult SynchronizePresent();
 
-    void RecreateSwapChain(
+    VkResult RecreateSwapChain(
             BOOL                      Vsync);
 
     void CreateFrameLatencyEvent();

@@ -3,6 +3,7 @@
 #include <new>
 
 #include "../../include/native/ohos/dxvk_native_ohos.h"
+#include "../dxvk/dxvk_state_cache.h"
 #include "../wsi/ohos_window_registry.h"
 
 namespace {
@@ -84,6 +85,15 @@ extern "C" {
     } catch (...) {
       return DXVK_OHOS_WINDOW_UNAVAILABLE;
     }
+  }
+
+  int32_t DXVKOhosGetStateCacheStats(DXVKOhosStateCacheStats* stats) {
+    if (!stats || stats->size != sizeof(*stats))
+      return DXVK_OHOS_WINDOW_INVALID_ARGUMENT;
+    const auto current = dxvk::getStateCacheStats();
+    *stats = { sizeof(*stats), 1, current.instances, current.filesRead,
+      current.entriesRead, current.entriesWritten };
+    return DXVK_OHOS_WINDOW_OK;
   }
 
 }

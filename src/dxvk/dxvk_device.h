@@ -186,8 +186,20 @@ namespace dxvk {
      * \returns Device status
      */
     VkResult getDeviceStatus() const {
+#if defined(DXVK_NATIVE_OHOS)
+      const VkResult injected = m_ohosTestStatus.load();
+      if (injected != VK_SUCCESS)
+        return injected;
+#endif
       return m_submissionQueue.getLastError();
     }
+
+#if defined(DXVK_NATIVE_OHOS)
+    bool injectDeviceLostForTest() {
+      VkResult expected = VK_SUCCESS;
+      return m_ohosTestStatus.compare_exchange_strong(expected, VK_ERROR_DEVICE_LOST);
+    }
+#endif
 
     /**
      * \brief Checks whether this is a UMA system
@@ -510,6 +522,12 @@ namespace dxvk {
     DxvkRecycler<DxvkDescriptorPool, 16> m_recycledDescriptorPools;
     
     DxvkSubmissionQueue m_submissionQueue;
+
+#if defined(DXVK_NATIVE_OHOS)
+    // Test-only status override. It drives the public D3D11 removal query but
+    // deliberately leaves a healthy Vulkan queue drainable for clean recovery.
+    std::atomic<VkResult> m_ohosTestStatus = { VK_SUCCESS };
+#endif
 
     DxvkDevicePerfHints getPerfHints();
     

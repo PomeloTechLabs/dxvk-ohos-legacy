@@ -8,12 +8,36 @@
 #include "d3d11_enums.h"
 #include "d3d11_interop.h"
 
+#if defined(DXVK_NATIVE_OHOS)
+#include "../../include/native/ohos/dxvk_native_ohos.h"
+#include "../util/util_env.h"
+#endif
+
 namespace dxvk {
   Logger Logger::s_instance("d3d11.log");
 }
   
 extern "C" {
   using namespace dxvk;
+
+#if defined(DXVK_NATIVE_OHOS)
+  DLLEXPORT int32_t DXVKOhosInjectDeviceLost(void* d3d11Device) {
+    if (d3d11Device == nullptr
+     || env::getEnvVar("DXVK_OHOS_TEST_DEVICE_LOST") != "1")
+      return DXVK_OHOS_WINDOW_INVALID_ARGUMENT;
+
+    auto* device = static_cast<D3D11Device*>(
+      static_cast<ID3D11Device*>(d3d11Device));
+    Rc<DxvkDevice> dxvkDevice = device->GetDXVKDevice();
+
+    if (dxvkDevice == nullptr)
+      return DXVK_OHOS_WINDOW_UNAVAILABLE;
+
+    return dxvkDevice->injectDeviceLostForTest()
+      ? DXVK_OHOS_WINDOW_OK
+      : DXVK_OHOS_WINDOW_UNAVAILABLE;
+  }
+#endif
   
   DLLEXPORT HRESULT __stdcall D3D11CoreCreateDevice(
           IDXGIFactory*       pFactory,

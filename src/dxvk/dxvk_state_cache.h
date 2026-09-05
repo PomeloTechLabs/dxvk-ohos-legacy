@@ -14,6 +14,15 @@ namespace dxvk {
 
   class DxvkDevice;
 
+  struct DxvkStateCacheStats {
+    uint64_t instances;
+    uint64_t filesRead;
+    uint64_t entriesRead;
+    uint64_t entriesWritten;
+  };
+
+  DxvkStateCacheStats getStateCacheStats();
+
   /**
    * \brief State cache
    * 

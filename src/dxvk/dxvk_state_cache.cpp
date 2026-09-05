@@ -4,6 +4,22 @@
 
 namespace dxvk {
 
+  namespace {
+    std::atomic<uint64_t> g_stateCacheInstances = { 0 };
+    std::atomic<uint64_t> g_stateCacheFilesRead = { 0 };
+    std::atomic<uint64_t> g_stateCacheEntriesRead = { 0 };
+    std::atomic<uint64_t> g_stateCacheEntriesWritten = { 0 };
+  }
+
+  DxvkStateCacheStats getStateCacheStats() {
+    return {
+      g_stateCacheInstances.load(),
+      g_stateCacheFilesRead.load(),
+      g_stateCacheEntriesRead.load(),
+      g_stateCacheEntriesWritten.load(),
+    };
+  }
+
   static const Sha1Hash       g_nullHash      = Sha1Hash::compute(nullptr, 0);
   static const DxvkShaderKey  g_nullShaderKey = DxvkShaderKey();
 
@@ -156,6 +172,7 @@ namespace dxvk {
   : m_device      (device),
     m_pipeManager (pipeManager),
     m_passManager (passManager) {
+    g_stateCacheInstances.fetch_add(1);
     bool newFile = !readCacheFile();
 
     if (newFile) {
@@ -457,7 +474,12 @@ namespace dxvk {
     }
     
     // Rewrite entire state cache if it is outdated
-    return curHeader.version == newHeader.version;
+    const bool current = curHeader.version == newHeader.version;
+    if (current) {
+      g_stateCacheFilesRead.fetch_add(1);
+      g_stateCacheEntriesRead.fetch_add(m_entries.size());
+    }
+    return current;
   }
 
 
@@ -912,7 +934,7 @@ namespace dxvk {
   void DxvkStateCache::workerFunc() {
     env::setThreadName("dxvk-shader");
 
-    while (!m_stopThreads.load()) {
+    while (true) {
       WorkerItem item;
 
       { std::unique_lock<dxvk::mutex> lock(m_workerLock);
@@ -945,7 +967,7 @@ namespace dxvk {
 
     std::ofstream file;
 
-    while (!m_stopThreads.load()) {
+    while (true) {
       DxvkStateCacheEntry entry;
 
       { std::unique_lock<dxvk::mutex> lock(m_writerLock);
@@ -969,6 +991,8 @@ namespace dxvk {
       }
 
       writeCacheEntry(file, entry);
+      if (file)
+        g_stateCacheEntriesWritten.fetch_add(1);
     }
   }
 

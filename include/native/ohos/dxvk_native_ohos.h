@@ -23,6 +23,15 @@ typedef struct DXVKOhosWindowInfo {
   uint64_t revision;
 } DXVKOhosWindowInfo;
 
+typedef struct DXVKOhosStateCacheStats {
+  uint32_t size;
+  uint32_t version;
+  uint64_t instances;
+  uint64_t filesRead;
+  uint64_t entriesRead;
+  uint64_t entriesWritten;
+} DXVKOhosStateCacheStats;
+
 #define DXVK_OHOS_API __attribute__((visibility("default")))
 
 /* Register during the XComponent surface-created callback, while window is
@@ -51,6 +60,18 @@ DXVK_OHOS_API int32_t DXVKOhosUnregisterWindow(DXVKOhosWindowHandle handle);
 
 DXVK_OHOS_API int32_t DXVKOhosGetWindowInfo(
   DXVKOhosWindowHandle handle, DXVKOhosWindowInfo* info);
+
+/* Process-lifetime, read-only telemetry for deterministic cache validation.
+ * It does not expose Vulkan handles or alter cache policy.
+ */
+DXVK_OHOS_API int32_t DXVKOhosGetStateCacheStats(
+  DXVKOhosStateCacheStats* stats);
+
+/* Test-only, same-process fault injection. The call is rejected unless
+ * DXVK_OHOS_TEST_DEVICE_LOST=1. It marks the supplied DXVK-backed D3D11
+ * device as lost so the normal GetDeviceRemovedReason path can be tested.
+ */
+DXVK_OHOS_API int32_t DXVKOhosInjectDeviceLost(void* d3d11Device);
 
 #ifdef __cplusplus
 }

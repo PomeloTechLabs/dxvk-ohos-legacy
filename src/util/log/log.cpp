@@ -5,13 +5,9 @@
 namespace dxvk {
   
   Logger::Logger(const std::string& file_name)
-  : m_minLevel(getMinLogLevel()) {
-    if (m_minLevel != LogLevel::None) {
-      auto path = getFileName(file_name);
-
-      if (!path.empty())
-        m_fileStream = std::ofstream(str::tows(path.c_str()).c_str());
-    }
+  : m_minLevel(getMinLogLevel()),
+    m_fileName(file_name) {
+    openFile();
   }
   
   
@@ -48,9 +44,30 @@ namespace dxvk {
   }
   
   
+  void Logger::openFile() {
+    if (m_minLevel == LogLevel::None || m_fileStream.is_open())
+      return;
+
+#if defined(DXVK_NATIVE_OHOS)
+    // Native libraries are loaded before the application can publish its
+    // private log directory. Defer opening until the first runtime message.
+    const std::string logPath = env::getEnvVar("DXVK_LOG_PATH");
+    if (logPath.empty() || logPath == "none")
+      return;
+#endif
+
+    const auto path = getFileName(m_fileName);
+    if (!path.empty()) {
+      m_fileStream.clear();
+      m_fileStream.open(str::tows(path.c_str()).c_str());
+    }
+  }
+
+
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     if (level >= m_minLevel) {
       std::lock_guard<dxvk::mutex> lock(m_mutex);
+      openFile();
       
       static std::array<const char*, 5> s_prefixes
         = {{ "trace: ", "debug: ", "info:  ", "warn:  ", "err:   " }};

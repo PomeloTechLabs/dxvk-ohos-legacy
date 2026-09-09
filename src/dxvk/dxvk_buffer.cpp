@@ -196,6 +196,11 @@ namespace dxvk {
     if (!backing || !backing->memory)
       return VK_ERROR_MEMORY_MAP_FAILED;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    if (backing->memory.memFlags() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+      return VK_SUCCESS;
+    #endif
+
     VkMappedMemoryRange range;
     range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     range.pNext  = nullptr;
@@ -291,6 +296,11 @@ namespace dxvk {
 
     if (!backing || !backing->memory)
       return VK_ERROR_MEMORY_MAP_FAILED;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    if (backing->memory.memFlags() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+      return VK_SUCCESS;
+    #endif
 
     const VkDeviceSize atom =
       m_device->properties().core.properties.limits.nonCoherentAtomSize;

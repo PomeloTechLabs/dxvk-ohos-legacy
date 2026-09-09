@@ -10,8 +10,8 @@
 
 namespace dxvk {
   
-  DxvkSwapchainBlitter::DxvkSwapchainBlitter(const Rc<DxvkDevice>& device)
-  : m_device(device) {
+  DxvkSwapchainBlitter::DxvkSwapchainBlitter(const Rc<DxvkDevice>& device, bool forceOpaque)
+  : m_device(device), m_forceOpaque(forceOpaque) {
     this->createSampler();
     this->createShaders();
   }
@@ -225,7 +225,7 @@ namespace dxvk {
 
     PresenterArgs args = { };
     args.srcOffset = srcRect.offset;
-    args.encodeSrgb = encodeSrgb;
+    args.flags = (encodeSrgb ? 1u : 0u) | (m_forceOpaque ? 2u : 0u);
 
     if (dstRect.extent == srcRect.extent)
       args.dstOffset = dstRect.offset;

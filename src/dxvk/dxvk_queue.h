@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -22,6 +23,24 @@ namespace dxvk {
    */
   struct DxvkSubmitStatus {
     std::atomic<VkResult> result = { VK_SUCCESS };
+
+    #if defined(DXVK_NATIVE_OHOS)
+    static uint64_t nowUs() {
+      return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    std::atomic<uint64_t> presentRequestedUs       = { 0ull };
+    std::atomic<uint64_t> csBeginUs                = { 0ull };
+    std::atomic<uint64_t> queueEnqueuedUs          = { 0ull };
+    std::atomic<uint64_t> queueDequeuedUs          = { 0ull };
+    std::atomic<uint64_t> queueLockAcquiredUs      = { 0ull };
+    std::atomic<uint64_t> driverDoneUs             = { 0ull };
+    std::atomic<uint64_t> submitTotalUsBeforePresent = { 0ull };
+    std::atomic<uint64_t> submitMaxUsBeforePresent = { 0ull };
+    std::atomic<uint32_t> submitCountBeforePresent = { 0u };
+    std::atomic<uint32_t> queueDepthAtEnqueue      = { 0u };
+    #endif
   };
 
 
@@ -194,6 +213,12 @@ namespace dxvk {
 
     std::queue<DxvkSubmitEntry> m_submitQueue;
     std::queue<DxvkSubmitEntry> m_finishQueue;
+
+    #if defined(DXVK_NATIVE_OHOS)
+    uint64_t                    m_g9SubmitTotalUs = 0;
+    uint64_t                    m_g9SubmitMaxUs = 0;
+    uint32_t                    m_g9SubmitCount = 0;
+    #endif
 
     dxvk::thread                m_submitThread;
     dxvk::thread                m_finishThread;

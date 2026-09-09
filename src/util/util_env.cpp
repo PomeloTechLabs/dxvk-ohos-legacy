@@ -1,5 +1,7 @@
 #include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <numeric>
 
@@ -8,11 +10,71 @@
 #include <limits.h>
 #endif
 
+#if defined(DXVK_NATIVE_OHOS)
+#include <qos/qos.h>
+#endif
+
 #include "util_env.h"
+#include "./log/log.h"
 
 #include "./com/com_include.h"
 
 namespace dxvk::env {
+
+#if defined(DXVK_NATIVE_OHOS)
+  static bool getOhosThreadQos(const std::string& name, QoS_Level& level) {
+    if (name == "dxvk-cs" || name == "dxvk-submit") {
+      level = QOS_USER_INTERACTIVE;
+      return true;
+    }
+
+    if (name == "dxvk-queue" || name == "dxvk-shader") {
+      level = QOS_USER_INITIATED;
+      return true;
+    }
+
+    if (name == "dxvk-writer") {
+      level = QOS_UTILITY;
+      return true;
+    }
+
+    return false;
+  }
+
+
+  static void setOhosThreadQos(const std::string& name) {
+    const char* mobileScheduler = std::getenv("GTAV_OHOS_MOBILE_SCHEDULER");
+    if (mobileScheduler == nullptr || std::strcmp(mobileScheduler, "1") != 0)
+      return;
+
+    QoS_Level requested = QOS_DEFAULT;
+    if (!getOhosThreadQos(name, requested))
+      return;
+
+    if (OH_QoS_SetThreadQoS(requested) != 0) {
+      Logger::warn(str::format(
+        "DXVK_OHOS_THREAD_QOS name=", name,
+        " requested=", int32_t(requested),
+        " status=set-failed"));
+      return;
+    }
+
+    QoS_Level actual = QOS_DEFAULT;
+    if (OH_QoS_GetThreadQoS(&actual) != 0) {
+      Logger::warn(str::format(
+        "DXVK_OHOS_THREAD_QOS name=", name,
+        " requested=", int32_t(requested),
+        " status=query-failed"));
+      return;
+    }
+
+    Logger::info(str::format(
+      "DXVK_OHOS_THREAD_QOS name=", name,
+      " requested=", int32_t(requested),
+      " actual=", int32_t(actual),
+      " status=active"));
+  }
+#endif
 
   std::string getEnvVar(const char* name) {
 #ifdef _WIN32
@@ -50,7 +112,7 @@ namespace dxvk::env {
   std::string getExeName() {
     std::string fullPath = getExePath();
     auto n = fullPath.find_last_of(env::PlatformDirSlash);
-    
+
     return (n != std::string::npos)
       ? fullPath.substr(n + 1)
       : fullPath;
@@ -91,8 +153,8 @@ namespace dxvk::env {
     return std::string();
 #endif
   }
-  
-  
+
+
   void setThreadName(const std::string& name) {
 #ifdef _WIN32
     using SetThreadDescriptionProc = HRESULT (WINAPI *) (HANDLE, PCWSTR);
@@ -109,6 +171,9 @@ namespace dxvk::env {
     std::array<char, 16> posixName = {};
     dxvk::str::strlcpy(posixName.data(), name.c_str(), 16);
     ::pthread_setname_np(pthread_self(), posixName.data());
+#if defined(DXVK_NATIVE_OHOS)
+    setOhosThreadQos(name);
+#endif
 #endif
   }
 
@@ -132,5 +197,5 @@ namespace dxvk::env {
     return !error && std::filesystem::is_directory(path, error);
 #endif
   }
-  
+
 }

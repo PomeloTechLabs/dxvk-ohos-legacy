@@ -32,6 +32,17 @@ typedef struct DXVKOhosStateCacheStats {
   uint64_t entriesWritten;
 } DXVKOhosStateCacheStats;
 
+typedef struct DXVKOhosPerformanceStats {
+  uint32_t size;
+  uint32_t version;
+  uint64_t sequence;
+  uint32_t fpsMilli;
+  uint32_t averageFrameUs;
+  uint32_t p95FrameUs;
+  uint32_t gpuLoadPermille;
+  uint32_t submissionsMilli;
+} DXVKOhosPerformanceStats;
+
 #define DXVK_OHOS_API __attribute__((visibility("default")))
 
 /* Register during the XComponent surface-created callback, while window is
@@ -67,11 +78,23 @@ DXVK_OHOS_API int32_t DXVKOhosGetWindowInfo(
 DXVK_OHOS_API int32_t DXVKOhosGetStateCacheStats(
   DXVKOhosStateCacheStats* stats);
 
+/* Rolling one-second telemetry from the active D3D11 present path. GPU load
+ * uses DXVK's queue-idle counter and therefore represents this process's GPU
+ * workload, not device-wide utilization. This call is read-only and lock-free.
+ */
+DXVK_OHOS_API int32_t DXVKOhosGetPerformanceStats(
+  DXVKOhosPerformanceStats* stats);
+
 /* Test-only, same-process fault injection. The call is rejected unless
  * DXVK_OHOS_TEST_DEVICE_LOST=1. It marks the supplied DXVK-backed D3D11
  * device as lost so the normal GetDeviceRemovedReason path can be tested.
  */
 DXVK_OHOS_API int32_t DXVKOhosInjectDeviceLost(void* d3d11Device);
+
+/* Opt-in, one-shot scene diagnostics. Called on the game's render thread
+ * after its first world frame; no effect unless DXVK_OHOS_CAPTURE_SCENE=1.
+ */
+DXVK_OHOS_API void DXVKOhosCaptureScene(void);
 
 #ifdef __cplusplus
 }

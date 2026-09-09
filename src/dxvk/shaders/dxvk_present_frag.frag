@@ -11,7 +11,7 @@ layout(push_constant)
 uniform present_info_t {
   ivec2 src_offset;
   ivec2 dst_offset;
-  uint encode_srgb;
+  uint present_flags;
 };
 
 void main() {
@@ -26,10 +26,12 @@ void main() {
       o_color.a);
   }
 
-  if (encode_srgb != 0u) {
+  if ((present_flags & 1u) != 0u) {
     vec3 linear = clamp(o_color.rgb, vec3(0.0f), vec3(1.0f));
     vec3 low = linear * 12.92f;
     vec3 high = 1.055f * pow(linear, vec3(1.0f / 2.4f)) - 0.055f;
     o_color.rgb = mix(high, low, lessThanEqual(linear, vec3(0.0031308f)));
   }
+  if ((present_flags & 2u) != 0u)
+    o_color.a = 1.0f;
 }

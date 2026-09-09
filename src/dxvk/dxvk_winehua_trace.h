@@ -164,7 +164,31 @@ namespace dxvk {
     return enabled;
   }
 
+#if defined(DXVK_NATIVE_OHOS)
+  inline bool winehuaSceneCaptureEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_OHOS_CAPTURE_SCENE");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  inline std::atomic<bool>& winehuaSceneCaptureRequested() {
+    static std::atomic<bool> requested { false };
+    return requested;
+  }
+
+  inline std::atomic<uint64_t>& winehuaSceneCaptureFrame() {
+    static std::atomic<uint64_t> frame { UINT64_MAX };
+    return frame;
+  }
+#endif
+
   inline uint64_t winehuaRenderTargetDumpFrame() {
+#if defined(DXVK_NATIVE_OHOS)
+    if (winehuaSceneCaptureEnabled())
+      return winehuaSceneCaptureFrame().load(std::memory_order_relaxed);
+#endif
     static uint64_t frame = UINT64_MAX;
     if (frame == UINT64_MAX) {
       const char* value = std::getenv("WINEHUA_DXVK_DUMP_FRAME");
@@ -342,6 +366,22 @@ namespace dxvk {
         pass = 0u;
     }
     return pass;
+  }
+
+  inline bool winehuaRenderTargetDumpSelectPass(uint32_t pass) {
+    const char* cursor = std::getenv("WINEHUA_DXVK_DUMP_PASS_LIST");
+    if (!cursor || !cursor[0])
+      return true;
+    while (*cursor) {
+      char* end = nullptr;
+      const unsigned long selected = std::strtoul(cursor, &end, 10);
+      if (end == cursor || (*end && *end != ','))
+        return false;
+      if (selected == pass)
+        return true;
+      cursor = *end ? end + 1 : end;
+    }
+    return false;
   }
 
   inline uint64_t winehuaRenderTargetDumpMaxBytes() {

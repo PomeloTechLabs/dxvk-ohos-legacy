@@ -47,6 +47,11 @@ namespace dxvk {
     entry.status  = status;
     entry.present = std::move(presentInfo);
 
+    #if defined(DXVK_NATIVE_OHOS)
+    status->queueDepthAtEnqueue = uint32_t(m_submitQueue.size());
+    status->queueEnqueuedUs = DxvkSubmitStatus::nowUs();
+    #endif
+
     m_submitQueue.push(std::move(entry));
     m_appendCond.notify_all();
   }
@@ -97,11 +102,26 @@ namespace dxvk {
       DxvkSubmitEntry entry = std::move(m_submitQueue.front());
       lock.unlock();
 
+      #if defined(DXVK_NATIVE_OHOS)
+      if (entry.status)
+        entry.status->queueDequeuedUs = DxvkSubmitStatus::nowUs();
+      #endif
+
       // Submit command buffer to device
       VkResult status = VK_NOT_READY;
 
       if (m_lastError != VK_ERROR_DEVICE_LOST) {
         std::lock_guard<dxvk::mutex> lock(m_mutexQueue);
+
+        #if defined(DXVK_NATIVE_OHOS)
+        const uint64_t g9DriverBeginUs = DxvkSubmitStatus::nowUs();
+        if (entry.status) {
+          entry.status->queueLockAcquiredUs = g9DriverBeginUs;
+          entry.status->submitTotalUsBeforePresent = m_g9SubmitTotalUs;
+          entry.status->submitMaxUsBeforePresent = m_g9SubmitMaxUs;
+          entry.status->submitCountBeforePresent = m_g9SubmitCount;
+        }
+        #endif
 
         if (entry.submit.cmdList != nullptr) {
           status = entry.submit.cmdList->submit(
@@ -110,6 +130,22 @@ namespace dxvk {
         } else if (entry.present.presenter != nullptr) {
           status = entry.present.presenter->presentImage();
         }
+
+        #if defined(DXVK_NATIVE_OHOS)
+        const uint64_t g9DriverDoneUs = DxvkSubmitStatus::nowUs();
+        if (entry.submit.cmdList != nullptr) {
+          const uint64_t g9SubmitUs = g9DriverDoneUs - g9DriverBeginUs;
+          m_g9SubmitTotalUs += g9SubmitUs;
+          if (g9SubmitUs > m_g9SubmitMaxUs)
+            m_g9SubmitMaxUs = g9SubmitUs;
+          m_g9SubmitCount += 1;
+        } else if (entry.status) {
+          entry.status->driverDoneUs = g9DriverDoneUs;
+          m_g9SubmitTotalUs = 0;
+          m_g9SubmitMaxUs = 0;
+          m_g9SubmitCount = 0;
+        }
+        #endif
       } else {
         // Don't submit anything after device loss
         // so that drivers get a chance to recover

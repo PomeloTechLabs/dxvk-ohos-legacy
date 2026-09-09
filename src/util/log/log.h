@@ -46,11 +46,13 @@ namespace dxvk {
     
     static Logger s_instance;
     
-    const LogLevel m_minLevel;
+    const LogLevel   m_minLevel;
+    const std::string m_fileName;
     
     dxvk::mutex   m_mutex;
     std::ofstream m_fileStream;
     
+    void openFile();
     void emitMsg(LogLevel level, const std::string& message);
     
     static LogLevel getMinLogLevel();

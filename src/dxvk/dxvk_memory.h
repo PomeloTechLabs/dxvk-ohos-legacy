@@ -156,6 +156,16 @@ namespace dxvk {
     }
 
     /**
+     * \brief Properties of the selected memory type
+     *
+     * Unlike the allocation request, this includes any additional properties
+     * exposed by the memory type that the allocator actually selected.
+     */
+    VkMemoryPropertyFlags memFlags() const {
+      return m_type ? m_type->memType.propertyFlags : 0;
+    }
+
+    /**
      * \brief Checks whether the memory slice is defined
      * 
      * \returns \c true if this slice points to actual device

@@ -1,6 +1,7 @@
 #include "vulkan_presenter.h"
 
 #if defined(DXVK_NATIVE_OHOS)
+#include <native_window/external_window.h>
 #include <optional>
 #endif
 
@@ -39,6 +40,27 @@ namespace dxvk::vk {
     #endif
 
     try {
+      #if defined(DXVK_NATIVE_OHOS)
+      {
+        ohos::WindowLease lease(m_nativeWindow);
+        if (!lease.drawable())
+          throw DxvkError("Native OpenHarmony window is not drawable");
+        const auto bufferExtent = desc.imageExtent.width && desc.imageExtent.height
+          ? desc.imageExtent : VkExtent2D { lease.width(), lease.height() };
+        const int geometryStatus = OH_NativeWindow_NativeWindowHandleOpt(
+          static_cast<OHNativeWindow*>(lease.nativeWindow()), SET_BUFFER_GEOMETRY,
+          static_cast<int32_t>(bufferExtent.width),
+          static_cast<int32_t>(bufferExtent.height));
+        if (geometryStatus != 0)
+          throw DxvkError(str::format(
+            "Failed to configure OpenHarmony native buffer geometry: ", geometryStatus));
+        Logger::info(str::format(
+          "Presenter: OpenHarmony buffer geometry: display=",
+          lease.width(), "x", lease.height(), " buffer=",
+          bufferExtent.width, "x", bufferExtent.height));
+      }
+      #endif
+
       if (createSurface() != VK_SUCCESS)
         throw DxvkError("Failed to create surface");
 
@@ -182,7 +204,8 @@ namespace dxvk::vk {
       return VK_ERROR_SURFACE_LOST_KHR;
     #endif
 
-    if (m_swapchain)
+    const bool replaceSwapchain = m_swapchain != VK_NULL_HANDLE;
+    if (replaceSwapchain)
       destroySwapchain();
 
     #if defined(DXVK_NATIVE_OHOS)
@@ -190,6 +213,14 @@ namespace dxvk::vk {
       m_info = { };
       m_windowRevision = lease.revision();
       return VK_SUCCESS;
+    }
+    if (replaceSwapchain && desc.imageExtent.width && desc.imageExtent.height) {
+      const int geometryStatus = OH_NativeWindow_NativeWindowHandleOpt(
+        static_cast<OHNativeWindow*>(lease.nativeWindow()), SET_BUFFER_GEOMETRY,
+        static_cast<int32_t>(desc.imageExtent.width),
+        static_cast<int32_t>(desc.imageExtent.height));
+      if (geometryStatus != 0)
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
     #endif
 
@@ -236,11 +267,6 @@ namespace dxvk::vk {
     m_info.presentMode  = pickPresentMode(modes.size(), modes.data(), desc.numPresentModes, desc.presentModes);
     m_info.imageExtent  = pickImageExtent(caps, desc.imageExtent);
     m_info.imageCount   = pickImageCount(caps, m_info.presentMode, desc.imageCount);
-
-    #if defined(DXVK_NATIVE_OHOS)
-    // XComponent dimensions are authoritative for a variable-size surface.
-    m_info.imageExtent = pickImageExtent(caps, { lease.width(), lease.height() });
-    #endif
 
     if (!m_info.imageExtent.width || !m_info.imageExtent.height) {
       m_info.imageCount = 0;
@@ -297,6 +323,7 @@ namespace dxvk::vk {
       "\n  Present mode: ", m_info.presentMode,
       "\n  Buffer size:  ", m_info.imageExtent.width, "x", m_info.imageExtent.height,
       "\n  Image count:  ", m_info.imageCount,
+      "\n  Alpha mode:   ", swapInfo.compositeAlpha,
       "\n  Exclusive FS: ", desc.fullScreenExclusive));
     
     if ((status = m_vkd->vkCreateSwapchainKHR(m_vkd->device(),

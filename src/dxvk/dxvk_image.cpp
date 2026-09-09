@@ -225,6 +225,11 @@ namespace dxvk {
     if (!m_image.memory || offset >= m_image.memory.length())
       return VK_ERROR_MEMORY_MAP_FAILED;
 
+    #if defined(DXVK_NATIVE_OHOS)
+    if (m_image.memory.memFlags() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+      return VK_SUCCESS;
+    #endif
+
     length = std::min(length, m_image.memory.length() - offset);
     if (!length)
       return VK_SUCCESS;

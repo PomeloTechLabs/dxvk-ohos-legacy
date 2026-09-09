@@ -5,6 +5,42 @@
 #if defined(DXVK_NATIVE_OHOS)
 #include "../dxgi/dxgi_ohos_swapchain.h"
 #include "../wsi/ohos_present_policy.h"
+
+#include <array>
+#include <atomic>
+#endif
+
+#if defined(DXVK_NATIVE_OHOS)
+namespace {
+
+  struct G9PerformanceCounters {
+    std::atomic<uint64_t> sequence { 0 };
+    std::atomic<uint32_t> fpsMilli { 0 };
+    std::atomic<uint32_t> averageFrameUs { 0 };
+    std::atomic<uint32_t> p95FrameUs { 0 };
+    std::atomic<uint32_t> gpuLoadPermille { 0 };
+    std::atomic<uint32_t> submissionsMilli { 0 };
+  } g9Performance;
+
+}
+
+extern "C" DXVK_OHOS_API int32_t DXVKOhosGetPerformanceStats(
+    DXVKOhosPerformanceStats* stats) {
+  if (!stats || stats->size != sizeof(*stats))
+    return DXVK_OHOS_WINDOW_INVALID_ARGUMENT;
+
+  DXVKOhosPerformanceStats current = {};
+  current.size = sizeof(current);
+  current.version = 1;
+  current.fpsMilli = g9Performance.fpsMilli.load(std::memory_order_relaxed);
+  current.averageFrameUs = g9Performance.averageFrameUs.load(std::memory_order_relaxed);
+  current.p95FrameUs = g9Performance.p95FrameUs.load(std::memory_order_relaxed);
+  current.gpuLoadPermille = g9Performance.gpuLoadPermille.load(std::memory_order_relaxed);
+  current.submissionsMilli = g9Performance.submissionsMilli.load(std::memory_order_relaxed);
+  current.sequence = g9Performance.sequence.load(std::memory_order_acquire);
+  *stats = current;
+  return DXVK_OHOS_WINDOW_OK;
+}
 #endif
 
 namespace dxvk {
@@ -336,12 +372,37 @@ namespace dxvk {
 
 
   HRESULT D3D11SwapChain::PresentImage(UINT SyncInterval, UINT PresentFlags) {
+    #if defined(DXVK_NATIVE_OHOS)
+    const auto g9NowUs = [] {
+      return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    const uint64_t g9EnterUs = g9NowUs();
+    uint64_t g9SyncUs = 0;
+    uint64_t g9FrameWaitUs = 0;
+    uint64_t g9AcquireUs = 0;
+    uint64_t g9SubmitUs = 0;
+    uint64_t g9CsWaitUs = 0;
+    uint64_t g9CsToQueueUs = 0;
+    uint64_t g9QueueWaitUs = 0;
+    uint64_t g9QueueLockWaitUs = 0;
+    uint64_t g9VkPresentUs = 0;
+    uint64_t g9PresentWakeUs = 0;
+    uint64_t g9CommandSubmitUs = 0;
+    uint64_t g9CommandSubmitMaxUs = 0;
+    uint32_t g9CommandSubmitCount = 0;
+    uint32_t g9QueueDepth = 0;
+    #endif
+
     Com<ID3D11DeviceContext> deviceContext = nullptr;
     m_parent->GetImmediateContext(&deviceContext);
 
     // Flush pending rendering commands before
     auto immediateContext = static_cast<D3D11ImmediateContext*>(deviceContext.ptr());
     immediateContext->Flush();
+    #if defined(DXVK_NATIVE_OHOS)
+    const uint64_t g9FlushDoneUs = g9NowUs();
+    #endif
 
     // Bump our frame id.
     #if !defined(DXVK_NATIVE_OHOS)
@@ -353,8 +414,37 @@ namespace dxvk {
       if ((PresentFlags & DXGI_PRESENT_DO_NOT_WAIT) && m_presentStatus.result.load() == VK_NOT_READY)
         return DXGI_ERROR_WAS_STILL_DRAWING;
       #endif
+      #if defined(DXVK_NATIVE_OHOS)
+      const uint64_t g9SyncBeginUs = g9NowUs();
+      #endif
       const auto synchronized = SynchronizePresent();
       #if defined(DXVK_NATIVE_OHOS)
+      const uint64_t g9SyncDoneUs = g9NowUs();
+      g9SyncUs += g9SyncDoneUs - g9SyncBeginUs;
+      const uint64_t g9RequestedUs = m_presentStatus.presentRequestedUs.load();
+      const uint64_t g9CsBeginUs = m_presentStatus.csBeginUs.load();
+      const uint64_t g9QueueEnqueuedUs = m_presentStatus.queueEnqueuedUs.load();
+      const uint64_t g9QueueDequeuedUs = m_presentStatus.queueDequeuedUs.load();
+      const uint64_t g9QueueLockUs = m_presentStatus.queueLockAcquiredUs.load();
+      const uint64_t g9DriverDoneUs = m_presentStatus.driverDoneUs.load();
+      if (g9RequestedUs && g9CsBeginUs >= g9RequestedUs)
+        g9CsWaitUs += g9CsBeginUs - g9RequestedUs;
+      if (g9CsBeginUs && g9QueueEnqueuedUs >= g9CsBeginUs)
+        g9CsToQueueUs += g9QueueEnqueuedUs - g9CsBeginUs;
+      if (g9QueueEnqueuedUs && g9QueueDequeuedUs >= g9QueueEnqueuedUs)
+        g9QueueWaitUs += g9QueueDequeuedUs - g9QueueEnqueuedUs;
+      if (g9QueueDequeuedUs && g9QueueLockUs >= g9QueueDequeuedUs)
+        g9QueueLockWaitUs += g9QueueLockUs - g9QueueDequeuedUs;
+      if (g9QueueLockUs && g9DriverDoneUs >= g9QueueLockUs)
+        g9VkPresentUs += g9DriverDoneUs - g9QueueLockUs;
+      if (g9DriverDoneUs && g9SyncDoneUs >= g9DriverDoneUs)
+        g9PresentWakeUs += g9SyncDoneUs - g9DriverDoneUs;
+      g9CommandSubmitUs += m_presentStatus.submitTotalUsBeforePresent.load();
+      g9CommandSubmitMaxUs = std::max(g9CommandSubmitMaxUs,
+        m_presentStatus.submitMaxUsBeforePresent.load());
+      g9CommandSubmitCount += m_presentStatus.submitCountBeforePresent.load();
+      g9QueueDepth = std::max(g9QueueDepth,
+        m_presentStatus.queueDepthAtEnqueue.load());
       if (synchronized != VK_SUCCESS) return ohos::presentResult(synchronized);
       #endif
 
@@ -372,14 +462,18 @@ namespace dxvk {
       // finish before it can be passed to vkAcquireNextImageKHR again.
       const bool nonBlocking = PresentFlags & DXGI_PRESENT_DO_NOT_WAIT;
       const auto inFlight = std::min(info.imageCount, GetActualFrameLatency());
+      const uint64_t g9FrameWaitBeginUs = g9NowUs();
       if (inFlight && m_frameId >= inFlight) {
         const auto ready = WaitForNativeFrame(m_frameId - inFlight + 1, nonBlocking);
         if (ready != S_OK) return ready;
       }
+      g9FrameWaitUs += g9NowUs() - g9FrameWaitBeginUs;
+      const uint64_t g9AcquireBeginUs = g9NowUs();
       const auto status = ohos::acquireForPresent(!nonBlocking,
         [&] { return m_presenter->acquireNextImage(sync, imageIndex, nonBlocking); },
         [&] { return RecreateSwapChain(m_vsync); },
         [] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
+      g9AcquireUs += g9NowUs() - g9AcquireBeginUs;
       if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
         return ohos::presentResult(status);
       info = m_presenter->info();
@@ -401,6 +495,9 @@ namespace dxvk {
 
       // Resolve back buffer if it is multisampled. We
       // only have to do it only for the first frame.
+      #if defined(DXVK_NATIVE_OHOS)
+      const uint64_t g9SubmitBeginUs = g9NowUs();
+      #endif
       m_context->beginRecording(
         m_device->createCommandList());
       
@@ -419,10 +516,181 @@ namespace dxvk {
       const bool lastPresent = i + 1 >= std::max(SyncInterval, 1u);
       SubmitPresent(immediateContext, sync, i,
         lastPresent ? m_frameId + 1 : 0);
+      #if defined(DXVK_NATIVE_OHOS)
+      g9SubmitUs += g9NowUs() - g9SubmitBeginUs;
+      #endif
     }
 
     #if !defined(DXVK_NATIVE_OHOS)
     SyncFrameLatency();
+    #else
+    const uint64_t g9ExitUs = g9NowUs();
+    const uint64_t g9FlushUs = g9FlushDoneUs - g9EnterUs;
+    const uint64_t g9TotalUs = g9ExitUs - g9EnterUs;
+    static uint64_t g9RateStartUs = 0;
+    static uint64_t g9Frames = 0;
+    static uint64_t g9TotalAccumUs = 0;
+    static uint64_t g9FlushAccumUs = 0;
+    static uint64_t g9SyncAccumUs = 0;
+    static uint64_t g9FrameWaitAccumUs = 0;
+    static uint64_t g9AcquireAccumUs = 0;
+    static uint64_t g9SubmitAccumUs = 0;
+    static uint64_t g9CsWaitAccumUs = 0;
+    static uint64_t g9CsToQueueAccumUs = 0;
+    static uint64_t g9QueueWaitAccumUs = 0;
+    static uint64_t g9QueueLockWaitAccumUs = 0;
+    static uint64_t g9VkPresentAccumUs = 0;
+    static uint64_t g9PresentWakeAccumUs = 0;
+    static uint64_t g9CommandSubmitAccumUs = 0;
+    static uint64_t g9CommandSubmitMaxAccumUs = 0;
+    static uint64_t g9CommandSubmitCountAccum = 0;
+    static uint32_t g9MaxQueueDepth = 0;
+    static uint64_t g9MaxTotalUs = 0;
+    static uint64_t g9MaxSyncUs = 0;
+    static uint64_t g9MaxFrameWaitUs = 0;
+    static uint64_t g9MaxAcquireUs = 0;
+    static uint64_t g9MaxSubmitUs = 0;
+    static uint64_t g9MaxCsWaitUs = 0;
+    static uint64_t g9MaxQueueWaitUs = 0;
+    static uint64_t g9MaxVkPresentUs = 0;
+    static uint64_t g9Over50 = 0;
+    static uint64_t g9HudStartUs = 0;
+    static uint64_t g9HudPreviousFrameUs = 0;
+    static uint64_t g9HudFrames = 0;
+    static uint64_t g9HudSubmissions = 0;
+    static uint64_t g9HudPreviousGpuIdleUs = 0;
+    static std::array<uint32_t, 128> g9HudFrameIntervals = {};
+    static uint32_t g9HudFrameIntervalCount = 0;
+    if (!g9RateStartUs) g9RateStartUs = g9EnterUs;
+    ++g9Frames;
+    g9TotalAccumUs += g9TotalUs;
+    g9FlushAccumUs += g9FlushUs;
+    g9SyncAccumUs += g9SyncUs;
+    g9FrameWaitAccumUs += g9FrameWaitUs;
+    g9AcquireAccumUs += g9AcquireUs;
+    g9SubmitAccumUs += g9SubmitUs;
+    g9CsWaitAccumUs += g9CsWaitUs;
+    g9CsToQueueAccumUs += g9CsToQueueUs;
+    g9QueueWaitAccumUs += g9QueueWaitUs;
+    g9QueueLockWaitAccumUs += g9QueueLockWaitUs;
+    g9VkPresentAccumUs += g9VkPresentUs;
+    g9PresentWakeAccumUs += g9PresentWakeUs;
+    g9CommandSubmitAccumUs += g9CommandSubmitUs;
+    g9CommandSubmitMaxAccumUs = std::max(g9CommandSubmitMaxAccumUs,
+      g9CommandSubmitMaxUs);
+    g9CommandSubmitCountAccum += g9CommandSubmitCount;
+    g9MaxQueueDepth = std::max(g9MaxQueueDepth, g9QueueDepth);
+    g9MaxTotalUs = std::max(g9MaxTotalUs, g9TotalUs);
+    g9MaxSyncUs = std::max(g9MaxSyncUs, g9SyncUs);
+    g9MaxFrameWaitUs = std::max(g9MaxFrameWaitUs, g9FrameWaitUs);
+    g9MaxAcquireUs = std::max(g9MaxAcquireUs, g9AcquireUs);
+    g9MaxSubmitUs = std::max(g9MaxSubmitUs, g9SubmitUs);
+    g9MaxCsWaitUs = std::max(g9MaxCsWaitUs, g9CsWaitUs);
+    g9MaxQueueWaitUs = std::max(g9MaxQueueWaitUs, g9QueueWaitUs);
+    g9MaxVkPresentUs = std::max(g9MaxVkPresentUs, g9VkPresentUs);
+    if (g9TotalUs >= 50000) ++g9Over50;
+    if (!g9HudStartUs) {
+      g9HudStartUs = g9EnterUs;
+      g9HudPreviousFrameUs = g9EnterUs;
+      g9HudPreviousGpuIdleUs = m_device->getStatCounters()
+        .getCtr(DxvkStatCounter::GpuIdleTicks);
+    }
+    const uint64_t g9HudIntervalUs = g9EnterUs - g9HudPreviousFrameUs;
+    g9HudPreviousFrameUs = g9EnterUs;
+    if (g9HudIntervalUs && g9HudIntervalUs <= UINT32_MAX &&
+        g9HudFrameIntervalCount < g9HudFrameIntervals.size())
+      g9HudFrameIntervals[g9HudFrameIntervalCount++] =
+        static_cast<uint32_t>(g9HudIntervalUs);
+    ++g9HudFrames;
+    g9HudSubmissions += g9CommandSubmitCount;
+    const uint64_t g9HudElapsedUs = g9ExitUs - g9HudStartUs;
+    if (g9HudElapsedUs >= 1000000 && g9HudFrames) {
+      auto sortedIntervals = g9HudFrameIntervals;
+      std::sort(sortedIntervals.begin(),
+        sortedIntervals.begin() + g9HudFrameIntervalCount);
+      const uint32_t g9HudP95Us = g9HudFrameIntervalCount
+        ? sortedIntervals[((g9HudFrameIntervalCount - 1) * 95) / 100]
+        : static_cast<uint32_t>(g9HudElapsedUs / g9HudFrames);
+      const uint64_t g9HudGpuIdleUs = m_device->getStatCounters()
+        .getCtr(DxvkStatCounter::GpuIdleTicks);
+      const uint64_t g9HudIdleDeltaUs = g9HudGpuIdleUs >= g9HudPreviousGpuIdleUs
+        ? g9HudGpuIdleUs - g9HudPreviousGpuIdleUs : 0;
+      const uint64_t g9HudBusyUs = g9HudElapsedUs > g9HudIdleDeltaUs
+        ? g9HudElapsedUs - g9HudIdleDeltaUs : 0;
+      g9Performance.fpsMilli.store(static_cast<uint32_t>(
+        g9HudFrames * 1000000000ull / g9HudElapsedUs), std::memory_order_relaxed);
+      g9Performance.averageFrameUs.store(static_cast<uint32_t>(
+        g9HudElapsedUs / g9HudFrames), std::memory_order_relaxed);
+      g9Performance.p95FrameUs.store(g9HudP95Us, std::memory_order_relaxed);
+      g9Performance.gpuLoadPermille.store(static_cast<uint32_t>(
+        std::min<uint64_t>(1000, g9HudBusyUs * 1000 / g9HudElapsedUs)),
+        std::memory_order_relaxed);
+      g9Performance.submissionsMilli.store(static_cast<uint32_t>(
+        g9HudSubmissions * 1000 / g9HudFrames), std::memory_order_relaxed);
+      g9Performance.sequence.fetch_add(1, std::memory_order_release);
+      g9HudStartUs = g9ExitUs;
+      g9HudFrames = 0;
+      g9HudSubmissions = 0;
+      g9HudPreviousGpuIdleUs = g9HudGpuIdleUs;
+      g9HudFrameIntervalCount = 0;
+    }
+    if (g9ExitUs - g9RateStartUs >= 5000000) {
+      Logger::info(str::format(
+        "G9_DXVK_PRESENT_PHASE frames=", g9Frames,
+        " totalMs=", (g9ExitUs - g9RateStartUs) / 1000,
+        " avgFlushUs=", g9FlushAccumUs / g9Frames,
+        " avgSyncUs=", g9SyncAccumUs / g9Frames,
+        " avgFrameWaitUs=", g9FrameWaitAccumUs / g9Frames,
+        " avgAcquireUs=", g9AcquireAccumUs / g9Frames,
+        " avgSubmitUs=", g9SubmitAccumUs / g9Frames,
+        " avgCsWaitUs=", g9CsWaitAccumUs / g9Frames,
+        " avgCsToQueueUs=", g9CsToQueueAccumUs / g9Frames,
+        " avgQueueWaitUs=", g9QueueWaitAccumUs / g9Frames,
+        " avgQueueLockWaitUs=", g9QueueLockWaitAccumUs / g9Frames,
+        " avgVkPresentUs=", g9VkPresentAccumUs / g9Frames,
+        " avgPresentWakeUs=", g9PresentWakeAccumUs / g9Frames,
+        " commandSubmitCount=", g9CommandSubmitCountAccum,
+        " avgCommandSubmitUs=", g9CommandSubmitCountAccum
+          ? g9CommandSubmitAccumUs / g9CommandSubmitCountAccum : 0,
+        " maxCommandSubmitUs=", g9CommandSubmitMaxAccumUs,
+        " maxQueueDepth=", g9MaxQueueDepth,
+        " maxTotalMs=", g9MaxTotalUs / 1000,
+        " maxSyncMs=", g9MaxSyncUs / 1000,
+        " maxFrameWaitMs=", g9MaxFrameWaitUs / 1000,
+        " maxAcquireMs=", g9MaxAcquireUs / 1000,
+        " maxSubmitMs=", g9MaxSubmitUs / 1000,
+        " maxCsWaitMs=", g9MaxCsWaitUs / 1000,
+        " maxQueueWaitMs=", g9MaxQueueWaitUs / 1000,
+        " maxVkPresentMs=", g9MaxVkPresentUs / 1000,
+        " over50=", g9Over50));
+      g9RateStartUs = g9ExitUs;
+      g9Frames = 0;
+      g9TotalAccumUs = 0;
+      g9FlushAccumUs = 0;
+      g9SyncAccumUs = 0;
+      g9FrameWaitAccumUs = 0;
+      g9AcquireAccumUs = 0;
+      g9SubmitAccumUs = 0;
+      g9CsWaitAccumUs = 0;
+      g9CsToQueueAccumUs = 0;
+      g9QueueWaitAccumUs = 0;
+      g9QueueLockWaitAccumUs = 0;
+      g9VkPresentAccumUs = 0;
+      g9PresentWakeAccumUs = 0;
+      g9CommandSubmitAccumUs = 0;
+      g9CommandSubmitMaxAccumUs = 0;
+      g9CommandSubmitCountAccum = 0;
+      g9MaxQueueDepth = 0;
+      g9MaxTotalUs = 0;
+      g9MaxSyncUs = 0;
+      g9MaxFrameWaitUs = 0;
+      g9MaxAcquireUs = 0;
+      g9MaxSubmitUs = 0;
+      g9MaxCsWaitUs = 0;
+      g9MaxQueueWaitUs = 0;
+      g9MaxVkPresentUs = 0;
+      g9Over50 = 0;
+    }
     #endif
     return S_OK;
   }
@@ -453,6 +721,18 @@ namespace dxvk {
 
     // Present from CS thread so that we don't
     // have to synchronize with it first.
+    #if defined(DXVK_NATIVE_OHOS)
+    m_presentStatus.csBeginUs = 0;
+    m_presentStatus.queueEnqueuedUs = 0;
+    m_presentStatus.queueDequeuedUs = 0;
+    m_presentStatus.queueLockAcquiredUs = 0;
+    m_presentStatus.driverDoneUs = 0;
+    m_presentStatus.submitTotalUsBeforePresent = 0;
+    m_presentStatus.submitMaxUsBeforePresent = 0;
+    m_presentStatus.submitCountBeforePresent = 0;
+    m_presentStatus.queueDepthAtEnqueue = 0;
+    m_presentStatus.presentRequestedUs = DxvkSubmitStatus::nowUs();
+    #endif
     m_presentStatus.result = VK_NOT_READY;
 
     pContext->EmitCs([this,
@@ -462,6 +742,9 @@ namespace dxvk {
       cHud         = m_hud,
       cCommandList = m_context->endRecording()
     ] (DxvkContext* ctx) {
+      #if defined(DXVK_NATIVE_OHOS)
+      m_presentStatus.csBeginUs = DxvkSubmitStatus::nowUs();
+      #endif
       m_device->submitCommandList(cCommandList,
         cSync.acquire, cSync.present);
 
@@ -684,7 +967,15 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreateBlitter() {
-    m_blitter = new DxvkSwapchainBlitter(m_device);    
+#if defined(DXVK_NATIVE_OHOS)
+    // OHOS can expose only INHERIT composite alpha. HWND swap chains still
+    // require DXGI_ALPHA_MODE_IGNORE, regardless of the window's blend mode.
+    const bool forceOpaque = m_desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE;
+    m_blitter = new DxvkSwapchainBlitter(m_device, forceOpaque);
+    Logger::info(str::format("DXVK OHOS present: ignoreSourceAlpha=", forceOpaque ? 1 : 0));
+#else
+    m_blitter = new DxvkSwapchainBlitter(m_device);
+#endif
   }
 
 

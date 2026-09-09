@@ -148,6 +148,16 @@ namespace dxvk {
 
 
   void DxvkContext::winehuaFrameBoundary(uint64_t nextFrameId) {
+#if defined(DXVK_NATIVE_OHOS)
+    if (winehuaSceneCaptureEnabled()
+     && winehuaSceneCaptureRequested().exchange(false, std::memory_order_acquire)
+     && winehuaSceneCaptureFrame().load(std::memory_order_relaxed) == UINT64_MAX) {
+      // Allow an already queued present to retire before sampling a complete
+      // world frame. The request originates after the game's first scene draw.
+      winehuaSceneCaptureFrame().store(nextFrameId + 1, std::memory_order_relaxed);
+      Logger::info(str::format("WineHuaSceneCapture: selected frame=", nextFrameId + 1));
+    }
+#endif
     if (winehuaRenderTargetDumpEnabled()) {
       if (m_winehuaFrameId == winehuaRenderTargetDumpFrame())
         this->winehuaWriteRenderTargetDumps();
@@ -5274,7 +5284,8 @@ namespace dxvk {
   void DxvkContext::winehuaCaptureRenderPass(
     const DxvkFramebufferInfo&  framebufferInfo,
     const DxvkRenderPassOps&    ops) {
-    if (m_winehuaActivePassId < winehuaRenderTargetDumpFirstPass())
+    if (m_winehuaActivePassId < winehuaRenderTargetDumpFirstPass()
+     || !winehuaRenderTargetDumpSelectPass(m_winehuaActivePassId))
       return;
 
     const std::string resourceViews = m_winehuaLastGraphicsResourceViews;

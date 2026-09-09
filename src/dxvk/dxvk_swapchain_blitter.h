@@ -22,7 +22,7 @@ namespace dxvk {
     
   public:
 
-    DxvkSwapchainBlitter(const Rc<DxvkDevice>& device);
+    DxvkSwapchainBlitter(const Rc<DxvkDevice>& device, bool forceOpaque = false);
     ~DxvkSwapchainBlitter();
 
     /**
@@ -67,10 +67,11 @@ namespace dxvk {
         VkExtent2D srcExtent;
         VkOffset2D dstOffset;
       };
-      uint32_t encodeSrgb;
+      uint32_t flags; // bit 0: encode sRGB; bit 1: ignore source alpha
     };
 
     Rc<DxvkDevice>      m_device;
+    bool               m_forceOpaque;
 
     Rc<DxvkShader>      m_fsCopy;
     Rc<DxvkShader>      m_fsBlit;

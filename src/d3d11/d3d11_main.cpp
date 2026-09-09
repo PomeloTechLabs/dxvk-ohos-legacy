@@ -11,6 +11,7 @@
 #if defined(DXVK_NATIVE_OHOS)
 #include "../../include/native/ohos/dxvk_native_ohos.h"
 #include "../util/util_env.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 #endif
 
 namespace dxvk {
@@ -21,6 +22,11 @@ extern "C" {
   using namespace dxvk;
 
 #if defined(DXVK_NATIVE_OHOS)
+  DLLEXPORT void DXVKOhosCaptureScene() {
+    if (winehuaSceneCaptureEnabled())
+      winehuaSceneCaptureRequested().store(true, std::memory_order_release);
+  }
+
   DLLEXPORT int32_t DXVKOhosInjectDeviceLost(void* d3d11Device) {
     if (d3d11Device == nullptr
      || env::getEnvVar("DXVK_OHOS_TEST_DEVICE_LOST") != "1")

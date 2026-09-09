@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <limits>
 #if defined(DXVK_NATIVE_OHOS)
@@ -16,7 +17,6 @@
 namespace dxvk {
 
   static std::atomic<uint64_t> g_winehuaRecordingId = { 0 };
-  static std::atomic<bool> g_winehuaMappedFlushBatchLogged = { false };
   static std::atomic<uint64_t> g_winehuaMappedFlushLists = { 0 };
   static std::atomic<uint64_t> g_winehuaMappedFlushQueuedRanges = { 0 };
   static std::atomic<uint64_t> g_winehuaMappedFlushEmittedRanges = { 0 };
@@ -25,6 +25,47 @@ namespace dxvk {
   static std::atomic<uint64_t> g_winehuaMappedFlushEmittedBytes = { 0 };
   static std::atomic<uint64_t> g_winehuaMappedFlushWholeRanges = { 0 };
   static std::atomic<uint64_t> g_winehuaMappedFlushFailures = { 0 };
+
+#if defined(DXVK_NATIVE_OHOS)
+  struct G9SubmitPhaseWindow {
+    uint64_t reportStartUs = 0;
+    uint64_t mappedFlushUs = 0;
+    uint64_t mappedFlushMaxUs = 0;
+    uint64_t queueSubmitUs = 0;
+    uint64_t queueSubmitMaxUs = 0;
+    uint64_t submissions = 0;
+  };
+
+  static thread_local G9SubmitPhaseWindow g_g9SubmitPhase;
+  static thread_local uint64_t g_g9CurrentQueueSubmitUs = 0;
+
+  static uint64_t g9SteadyClockUs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+
+  static void g9RecordSubmitPhase(uint64_t mappedFlushUs, uint64_t queueSubmitUs) {
+    auto& phase = g_g9SubmitPhase;
+    const uint64_t now = g9SteadyClockUs();
+    if (!phase.reportStartUs)
+      phase.reportStartUs = now;
+    phase.mappedFlushUs += mappedFlushUs;
+    phase.mappedFlushMaxUs = std::max(phase.mappedFlushMaxUs, mappedFlushUs);
+    phase.queueSubmitUs += queueSubmitUs;
+    phase.queueSubmitMaxUs = std::max(phase.queueSubmitMaxUs, queueSubmitUs);
+    phase.submissions += 1;
+
+    if (now - phase.reportStartUs >= 5000000u) {
+      Logger::info(str::format(
+        "G9_DXVK_SUBMIT_PHASE submissions=", phase.submissions,
+        " avgMappedFlushUs=", phase.submissions ? phase.mappedFlushUs / phase.submissions : 0,
+        " maxMappedFlushUs=", phase.mappedFlushMaxUs,
+        " avgVkQueueSubmitUs=", phase.submissions ? phase.queueSubmitUs / phase.submissions : 0,
+        " maxVkQueueSubmitUs=", phase.queueSubmitMaxUs));
+      phase = G9SubmitPhaseWindow();
+    }
+  }
+#endif
     
   DxvkCommandList::DxvkCommandList(DxvkDevice* device)
   : m_device        (device),
@@ -108,9 +149,20 @@ namespace dxvk {
     const auto& graphics = m_device->queues().graphics;
     const auto& transfer = m_device->queues().transfer;
 
+#if defined(DXVK_NATIVE_OHOS)
+    g_g9CurrentQueueSubmitUs = 0;
+    const uint64_t mappedFlushStartUs = g9SteadyClockUs();
+#endif
     const VkResult mappedFlushResult = flushWineHuaMappedFlushes();
-    if (mappedFlushResult != VK_SUCCESS)
+    if (mappedFlushResult != VK_SUCCESS) {
+#if defined(DXVK_NATIVE_OHOS)
+      g9RecordSubmitPhase(g9SteadyClockUs() - mappedFlushStartUs, 0);
+#endif
       return mappedFlushResult;
+    }
+#if defined(DXVK_NATIVE_OHOS)
+    const uint64_t mappedFlushUs = g9SteadyClockUs() - mappedFlushStartUs;
+#endif
 
     m_submission.reset();
 
@@ -121,8 +173,12 @@ namespace dxvk {
         m_submission.addWakeSemaphore(m_sdmaSemaphore, 0);
         VkResult status = submitToQueue(transfer.queueHandle, VK_NULL_HANDLE, m_submission);
 
-        if (status != VK_SUCCESS)
+        if (status != VK_SUCCESS) {
+#if defined(DXVK_NATIVE_OHOS)
+          g9RecordSubmitPhase(mappedFlushUs, g_g9CurrentQueueSubmitUs);
+#endif
           return status;
+        }
 
         m_submission.reset();
         m_submission.addWaitSemaphore(m_sdmaSemaphore, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -179,15 +235,44 @@ namespace dxvk {
       m_submission.addWakeSemaphore(entry.fence->handle(), entry.value);
     }
 
-    return submitToQueue(graphics.queueHandle, m_fence, m_submission);
+    const VkResult result = submitToQueue(graphics.queueHandle, m_fence, m_submission);
+#if defined(DXVK_NATIVE_OHOS)
+    g9RecordSubmitPhase(mappedFlushUs, g_g9CurrentQueueSubmitUs);
+#endif
+    return result;
   }
 
 
   VkResult DxvkCommandList::queueWineHuaMappedFlush(
           Rc<DxvkResource>          resource,
     const VkMappedMemoryRange&      range) {
-    if (!g_winehuaMappedFlushBatchLogged.exchange(true))
-      Logger::info("WineHua: command-list-owned mapped flush batching enabled");
+    if (!range.size)
+      return VK_SUCCESS;
+
+    const auto rangeEnd = [] (const VkMappedMemoryRange& value) {
+      if (value.size == VK_WHOLE_SIZE
+       || value.size > std::numeric_limits<VkDeviceSize>::max() - value.offset)
+        return std::numeric_limits<VkDeviceSize>::max();
+      return value.offset + value.size;
+    };
+
+    if (!m_winehuaMappedFlushes.empty()) {
+      WineHuaMappedFlush& previous = m_winehuaMappedFlushes.back();
+      if (previous.resource.ptr() == resource.ptr()
+       && previous.range.memory == range.memory) {
+        const VkDeviceSize previousEnd = rangeEnd(previous.range);
+        const VkDeviceSize nextEnd = rangeEnd(range);
+        if (range.offset <= previousEnd && previous.range.offset <= nextEnd) {
+          const VkDeviceSize mergedBegin = std::min(previous.range.offset, range.offset);
+          const VkDeviceSize mergedEnd = std::max(previousEnd, nextEnd);
+          previous.range.offset = mergedBegin;
+          previous.range.size = mergedEnd == std::numeric_limits<VkDeviceSize>::max()
+            ? VK_WHOLE_SIZE
+            : mergedEnd - mergedBegin;
+          return VK_SUCCESS;
+        }
+      }
+    }
 
     WineHuaMappedFlush pending;
     pending.resource = std::move(resource);
@@ -431,7 +516,14 @@ namespace dxvk {
     if (m_device->features().khrTimelineSemaphore.timelineSemaphore)
       submitInfo.pNext = &timelineInfo;
     
-    return m_vkd->vkQueueSubmit(queue, 1, &submitInfo, fence);
+#if defined(DXVK_NATIVE_OHOS)
+    const uint64_t queueSubmitStartUs = g9SteadyClockUs();
+#endif
+    const VkResult result = m_vkd->vkQueueSubmit(queue, 1, &submitInfo, fence);
+#if defined(DXVK_NATIVE_OHOS)
+    g_g9CurrentQueueSubmitUs += g9SteadyClockUs() - queueSubmitStartUs;
+#endif
+    return result;
   }
   
   void DxvkCommandList::cmdBeginDebugUtilsLabel(VkDebugUtilsLabelEXT *pLabelInfo) {

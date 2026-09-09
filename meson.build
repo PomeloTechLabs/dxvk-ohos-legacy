@@ -91,6 +91,8 @@ dxvk_extradep = [ ]
 if dxvk_native_ohos
   lib_vulkan          = cpp.find_library('vulkan')
   lib_native_window   = cpp.find_library('native_window')
+  lib_qos             = cpp.find_library('qos')
+  dxvk_extradep      += [ lib_qos ]
   lib_d3d9            = declare_dependency()
   lib_d3d11           = declare_dependency()
   lib_dxgi            = declare_dependency()

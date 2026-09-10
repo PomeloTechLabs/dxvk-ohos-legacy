@@ -1,4 +1,5 @@
 #include "dxbc_compiler.h"
+#include "dxbc_interface.h"
 
 namespace dxvk {
 
@@ -8223,7 +8224,9 @@ namespace dxvk {
         result.ccount = 4;
 
         if (m_isgn->findByRegister(regIdx))
-          result.ccount = m_isgn->regMask(regIdx).minComponents();
+          result.ccount = dxbcStageInterfaceComponentCount(
+            m_moduleInfo.options.supportsMaintenance4,
+            m_isgn->regMask(regIdx).minComponents());
         return result;
       }
     }
@@ -8260,7 +8263,9 @@ namespace dxvk {
         result.ccount = 4;
 
         if (m_osgn->findByRegister(regIdx))
-          result.ccount = m_osgn->regMask(regIdx).minComponents();
+          result.ccount = dxbcStageInterfaceComponentCount(
+            m_moduleInfo.options.supportsMaintenance4,
+            m_osgn->regMask(regIdx).minComponents());
         return result;
       }
     }

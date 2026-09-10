@@ -252,6 +252,8 @@ namespace dxvk {
                 || !required.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor)
         && (m_deviceFeatures.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor
                 || !required.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor)
+        && (m_deviceFeatures.khrMaintenance4.maintenance4
+                || !required.khrMaintenance4.maintenance4)
         && (m_deviceFeatures.khrTimelineSemaphore.timelineSemaphore
                 || !required.khrTimelineSemaphore.timelineSemaphore);
   }
@@ -267,7 +269,7 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 32> devExtensionList = {{
+    std::array<DxvkExt*, 33> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -294,6 +296,7 @@ namespace dxvk {
       &devExtensions.khrExternalMemoryWin32,
       &devExtensions.khrExternalSemaphoreWin32,
       &devExtensions.khrImageFormatList,
+      &devExtensions.khrMaintenance4,
       &devExtensions.khrSamplerMirrorClampToEdge,
       &devExtensions.khrShaderFloatControls,
       &devExtensions.khrSwapchain,
@@ -412,6 +415,11 @@ namespace dxvk {
     if (devExtensions.khrBufferDeviceAddress) {
       enabledFeatures.khrBufferDeviceAddress.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
       enabledFeatures.khrBufferDeviceAddress.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrBufferDeviceAddress);
+    }
+
+    if (devExtensions.khrMaintenance4) {
+      enabledFeatures.khrMaintenance4.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR;
+      enabledFeatures.khrMaintenance4.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrMaintenance4);
     }
 
     if (devExtensions.khrTimelineSemaphore) {
@@ -734,6 +742,11 @@ namespace dxvk {
       m_deviceFeatures.khrBufferDeviceAddress.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrBufferDeviceAddress);
     }
 
+    if (m_deviceExtensions.supports(VK_KHR_MAINTENANCE_4_EXTENSION_NAME)) {
+      m_deviceFeatures.khrMaintenance4.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR;
+      m_deviceFeatures.khrMaintenance4.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrMaintenance4);
+    }
+
     if (m_deviceExtensions.supports(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
       m_deviceFeatures.khrTimelineSemaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR;
       m_deviceFeatures.khrTimelineSemaphore.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrTimelineSemaphore);
@@ -835,6 +848,8 @@ namespace dxvk {
       "\n  vertexAttributeInstanceRateZeroDivisor : ", features.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor ? "1" : "0",
       "\n", VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
       "\n  bufferDeviceAddress                    : ", features.khrBufferDeviceAddress.bufferDeviceAddress,
+      "\n", VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
+      "\n  maintenance4                           : ", features.khrMaintenance4.maintenance4,
       "\n", VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
       "\n  timelineSemaphore                      : ", features.khrTimelineSemaphore.timelineSemaphore));
   }

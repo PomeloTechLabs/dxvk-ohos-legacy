@@ -2046,6 +2046,7 @@ namespace dxvk {
     enabled.shaderDrawParameters.shaderDrawParameters             = VK_TRUE;
 
     enabled.khrTimelineSemaphore.timelineSemaphore                = supported.khrTimelineSemaphore.timelineSemaphore;
+    enabled.khrMaintenance4.maintenance4                          = supported.khrMaintenance4.maintenance4;
 
     enabled.extMemoryPriority.memoryPriority                      = supported.extMemoryPriority.memoryPriority;
 

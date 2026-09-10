@@ -33,6 +33,10 @@ namespace dxvk {
     /// Use a SPIR-V extension to implement D3D-style discards
     bool useDemoteToHelperInvocation = false;
 
+    /// The consumer may declare fewer stage-interface components
+    /// than its producer.
+    bool supportsMaintenance4 = false;
+
     /// Use subgroup operations to discard fragment
     /// shader invocations if derivatives remain valid.
     bool useSubgroupOpsForEarlyDiscard = false;

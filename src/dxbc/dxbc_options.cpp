@@ -28,6 +28,8 @@ namespace dxvk {
      && (devInfo.coreSubgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
     useDemoteToHelperInvocation
       = (devFeatures.extShaderDemoteToHelperInvocation.shaderDemoteToHelperInvocation);
+    supportsMaintenance4
+      = (devFeatures.khrMaintenance4.maintenance4);
     useSubgroupOpsForEarlyDiscard
       = (devInfo.coreSubgroup.subgroupSize >= 4)
      && (devInfo.coreSubgroup.supportedStages     & VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -85,6 +87,9 @@ namespace dxvk {
     }
     if (useCombinedImageSampler)
       Logger::info("WineHua: combined image sampler compatibility mode enabled");
+    Logger::info(str::format(
+      "WineHua: DXBC stage interface path=",
+      supportsMaintenance4 ? "maintenance4-relaxed" : "full-register-compat"));
     Logger::info(str::format(
       "WineHua: Cube Dref coordinate path=",
       padCubeDrefCoordinates ? "padded-vec4" : "native-minimal"));

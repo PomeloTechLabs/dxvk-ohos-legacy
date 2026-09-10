@@ -20,6 +20,20 @@ namespace {
     std::atomic<uint32_t> p95FrameUs { 0 };
     std::atomic<uint32_t> gpuLoadPermille { 0 };
     std::atomic<uint32_t> submissionsMilli { 0 };
+    std::atomic<uint32_t> averageSyncUs { 0 };
+    std::atomic<uint32_t> averageFrameWaitUs { 0 };
+    std::atomic<uint32_t> averageAcquireUs { 0 };
+    std::atomic<uint32_t> averageCsWaitUs { 0 };
+    std::atomic<uint32_t> averageQueueWaitUs { 0 };
+    std::atomic<uint32_t> averageVkPresentUs { 0 };
+    std::atomic<uint32_t> averageCommandSubmitUs { 0 };
+    std::atomic<uint32_t> maxQueueDepth { 0 };
+    std::atomic<uint32_t> renderWidth { 0 };
+    std::atomic<uint32_t> renderHeight { 0 };
+    std::atomic<uint32_t> surfaceWidth { 0 };
+    std::atomic<uint32_t> surfaceHeight { 0 };
+    std::atomic<uint32_t> presentMode { UINT32_MAX };
+    std::atomic<uint32_t> imageCount { 0 };
   } g9Performance;
 
 }
@@ -31,12 +45,26 @@ extern "C" DXVK_OHOS_API int32_t DXVKOhosGetPerformanceStats(
 
   DXVKOhosPerformanceStats current = {};
   current.size = sizeof(current);
-  current.version = 1;
+  current.version = 2;
   current.fpsMilli = g9Performance.fpsMilli.load(std::memory_order_relaxed);
   current.averageFrameUs = g9Performance.averageFrameUs.load(std::memory_order_relaxed);
   current.p95FrameUs = g9Performance.p95FrameUs.load(std::memory_order_relaxed);
   current.gpuLoadPermille = g9Performance.gpuLoadPermille.load(std::memory_order_relaxed);
   current.submissionsMilli = g9Performance.submissionsMilli.load(std::memory_order_relaxed);
+  current.averageSyncUs = g9Performance.averageSyncUs.load(std::memory_order_relaxed);
+  current.averageFrameWaitUs = g9Performance.averageFrameWaitUs.load(std::memory_order_relaxed);
+  current.averageAcquireUs = g9Performance.averageAcquireUs.load(std::memory_order_relaxed);
+  current.averageCsWaitUs = g9Performance.averageCsWaitUs.load(std::memory_order_relaxed);
+  current.averageQueueWaitUs = g9Performance.averageQueueWaitUs.load(std::memory_order_relaxed);
+  current.averageVkPresentUs = g9Performance.averageVkPresentUs.load(std::memory_order_relaxed);
+  current.averageCommandSubmitUs = g9Performance.averageCommandSubmitUs.load(std::memory_order_relaxed);
+  current.maxQueueDepth = g9Performance.maxQueueDepth.load(std::memory_order_relaxed);
+  current.renderWidth = g9Performance.renderWidth.load(std::memory_order_relaxed);
+  current.renderHeight = g9Performance.renderHeight.load(std::memory_order_relaxed);
+  current.surfaceWidth = g9Performance.surfaceWidth.load(std::memory_order_relaxed);
+  current.surfaceHeight = g9Performance.surfaceHeight.load(std::memory_order_relaxed);
+  current.presentMode = g9Performance.presentMode.load(std::memory_order_relaxed);
+  current.imageCount = g9Performance.imageCount.load(std::memory_order_relaxed);
   current.sequence = g9Performance.sequence.load(std::memory_order_acquire);
   *stats = current;
   return DXVK_OHOS_WINDOW_OK;
@@ -392,6 +420,8 @@ namespace dxvk {
     uint64_t g9CommandSubmitMaxUs = 0;
     uint32_t g9CommandSubmitCount = 0;
     uint32_t g9QueueDepth = 0;
+    uint32_t g9PresentMode = UINT32_MAX;
+    uint32_t g9ImageCount = 0;
     #endif
 
     Com<ID3D11DeviceContext> deviceContext = nullptr;
@@ -477,6 +507,8 @@ namespace dxvk {
       if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
         return ohos::presentResult(status);
       info = m_presenter->info();
+      g9PresentMode = static_cast<uint32_t>(info.presentMode);
+      g9ImageCount = info.imageCount;
       // Count only frames actually submitted; timeouts must not leave holes
       // in the frame-latency fence's sequence.
       ++m_frameId;
@@ -558,6 +590,15 @@ namespace dxvk {
     static uint64_t g9HudPreviousFrameUs = 0;
     static uint64_t g9HudFrames = 0;
     static uint64_t g9HudSubmissions = 0;
+    static uint64_t g9HudSyncUs = 0;
+    static uint64_t g9HudFrameWaitUs = 0;
+    static uint64_t g9HudAcquireUs = 0;
+    static uint64_t g9HudCsWaitUs = 0;
+    static uint64_t g9HudQueueWaitUs = 0;
+    static uint64_t g9HudVkPresentUs = 0;
+    static uint64_t g9HudCommandSubmitUs = 0;
+    static uint64_t g9HudCommandSubmitCount = 0;
+    static uint32_t g9HudMaxQueueDepth = 0;
     static uint64_t g9HudPreviousGpuIdleUs = 0;
     static std::array<uint32_t, 128> g9HudFrameIntervals = {};
     static uint32_t g9HudFrameIntervalCount = 0;
@@ -603,6 +644,15 @@ namespace dxvk {
         static_cast<uint32_t>(g9HudIntervalUs);
     ++g9HudFrames;
     g9HudSubmissions += g9CommandSubmitCount;
+    g9HudSyncUs += g9SyncUs;
+    g9HudFrameWaitUs += g9FrameWaitUs;
+    g9HudAcquireUs += g9AcquireUs;
+    g9HudCsWaitUs += g9CsWaitUs;
+    g9HudQueueWaitUs += g9QueueWaitUs;
+    g9HudVkPresentUs += g9VkPresentUs;
+    g9HudCommandSubmitUs += g9CommandSubmitUs;
+    g9HudCommandSubmitCount += g9CommandSubmitCount;
+    g9HudMaxQueueDepth = std::max(g9HudMaxQueueDepth, g9QueueDepth);
     const uint64_t g9HudElapsedUs = g9ExitUs - g9HudStartUs;
     if (g9HudElapsedUs >= 1000000 && g9HudFrames) {
       auto sortedIntervals = g9HudFrameIntervals;
@@ -627,10 +677,54 @@ namespace dxvk {
         std::memory_order_relaxed);
       g9Performance.submissionsMilli.store(static_cast<uint32_t>(
         g9HudSubmissions * 1000 / g9HudFrames), std::memory_order_relaxed);
+      g9Performance.averageSyncUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudSyncUs / g9HudFrames)),
+        std::memory_order_relaxed);
+      g9Performance.averageFrameWaitUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudFrameWaitUs / g9HudFrames)),
+        std::memory_order_relaxed);
+      g9Performance.averageAcquireUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudAcquireUs / g9HudFrames)),
+        std::memory_order_relaxed);
+      g9Performance.averageCsWaitUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudCsWaitUs / g9HudFrames)),
+        std::memory_order_relaxed);
+      g9Performance.averageQueueWaitUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudQueueWaitUs / g9HudFrames)),
+        std::memory_order_relaxed);
+      g9Performance.averageVkPresentUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudVkPresentUs / g9HudFrames)),
+        std::memory_order_relaxed);
+      g9Performance.averageCommandSubmitUs.store(static_cast<uint32_t>(
+        std::min<uint64_t>(UINT32_MAX, g9HudCommandSubmitCount
+          ? g9HudCommandSubmitUs / g9HudCommandSubmitCount : 0)),
+        std::memory_order_relaxed);
+      g9Performance.maxQueueDepth.store(g9HudMaxQueueDepth,
+        std::memory_order_relaxed);
+      g9Performance.renderWidth.store(m_desc.Width, std::memory_order_relaxed);
+      g9Performance.renderHeight.store(m_desc.Height, std::memory_order_relaxed);
+      DXVKOhosWindowInfo g9Window = {};
+      if (SUCCEEDED(ohos::windowInfo(m_window, g9Window))) {
+        g9Performance.surfaceWidth.store(g9Window.width,
+          std::memory_order_relaxed);
+        g9Performance.surfaceHeight.store(g9Window.height,
+          std::memory_order_relaxed);
+      }
+      g9Performance.presentMode.store(g9PresentMode, std::memory_order_relaxed);
+      g9Performance.imageCount.store(g9ImageCount, std::memory_order_relaxed);
       g9Performance.sequence.fetch_add(1, std::memory_order_release);
       g9HudStartUs = g9ExitUs;
       g9HudFrames = 0;
       g9HudSubmissions = 0;
+      g9HudSyncUs = 0;
+      g9HudFrameWaitUs = 0;
+      g9HudAcquireUs = 0;
+      g9HudCsWaitUs = 0;
+      g9HudQueueWaitUs = 0;
+      g9HudVkPresentUs = 0;
+      g9HudCommandSubmitUs = 0;
+      g9HudCommandSubmitCount = 0;
+      g9HudMaxQueueDepth = 0;
       g9HudPreviousGpuIdleUs = g9HudGpuIdleUs;
       g9HudFrameIntervalCount = 0;
     }

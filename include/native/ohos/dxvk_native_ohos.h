@@ -41,6 +41,20 @@ typedef struct DXVKOhosPerformanceStats {
   uint32_t p95FrameUs;
   uint32_t gpuLoadPermille;
   uint32_t submissionsMilli;
+  uint32_t averageSyncUs;
+  uint32_t averageFrameWaitUs;
+  uint32_t averageAcquireUs;
+  uint32_t averageCsWaitUs;
+  uint32_t averageQueueWaitUs;
+  uint32_t averageVkPresentUs;
+  uint32_t averageCommandSubmitUs;
+  uint32_t maxQueueDepth;
+  uint32_t renderWidth;
+  uint32_t renderHeight;
+  uint32_t surfaceWidth;
+  uint32_t surfaceHeight;
+  uint32_t presentMode;
+  uint32_t imageCount;
 } DXVKOhosPerformanceStats;
 
 #define DXVK_OHOS_API __attribute__((visibility("default")))

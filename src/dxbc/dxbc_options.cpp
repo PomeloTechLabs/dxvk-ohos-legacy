@@ -85,6 +85,16 @@ namespace dxvk {
       else
         emulateCubeArrayDref = std::strstr(deviceName, "Maleoon") != nullptr;
     }
+    {
+      const std::string override =
+        env::getEnvVar("WINEHUA_DXVK_REPLACE_CUBE_DREF");
+      if (override == "1" || override == "true" || override == "one")
+        replaceCubeDref = 1;
+      else if (override == "0" || override == "false" || override == "zero")
+        replaceCubeDref = 0;
+      else
+        replaceCubeDref = -1;
+    }
     if (useCombinedImageSampler)
       Logger::info("WineHua: combined image sampler compatibility mode enabled");
     Logger::info(str::format(
@@ -97,12 +107,19 @@ namespace dxvk {
       "WineHua: CubeArray Dref path=",
       emulateCubeArrayDref ? "2d-array-emulation" : "native"));
     Logger::info(str::format(
+      "WineHua: Cube Dref replace path=",
+      replaceCubeDref < 0 ? "native"
+        : (replaceCubeDref > 0 ? "constant-1" : "constant-0")));
+    Logger::info(str::format(
       "WineHua: custom border capability path=",
       emulateCustomBorderColor ? "shader-emulation" : "native",
       " customBorderColors=",
       devFeatures.extCustomBorderColor.customBorderColors ? 1 : 0,
       " customBorderColorWithoutFormat=",
       devFeatures.extCustomBorderColor.customBorderColorWithoutFormat ? 1 : 0));
+    Logger::info(str::format(
+      "WineHua: RT output NaN fixup=",
+      enableRtOutputNanFixup ? "on" : "off"));
     dynamicIndexedConstantBufferAsSsbo = options.constantBufferRangeCheck;
 
     // Disable subgroup early discard on Nvidia because it may hurt performance

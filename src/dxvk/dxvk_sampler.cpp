@@ -1,6 +1,8 @@
 #include "dxvk_sampler.h"
 #include "dxvk_device.h"
 
+#include <cstring>
+
 namespace dxvk {
     
   DxvkSampler::DxvkSampler(
@@ -59,6 +61,7 @@ namespace dxvk {
         " minFilter=", samplerInfo.minFilter,
         " magFilter=", samplerInfo.magFilter,
         " mipmapMode=", samplerInfo.mipmapMode,
+        " flags=", samplerInfo.flags,
         " address=", samplerInfo.addressModeU, ",",
         samplerInfo.addressModeV, ",", samplerInfo.addressModeW,
         " lod=", samplerInfo.minLod, "..", samplerInfo.maxLod,

@@ -83,6 +83,11 @@ namespace dxvk {
     /// Maleoon otherwise hangs the Host Venus ring on CubeArray Dref.
     bool emulateCubeArrayDref = false;
 
+    /// Diagnostic only. Pixel-shader non-array Cube SampleC/SampleClz
+    /// returns this constant and omits OpImageSampleDref. -1 keeps native
+    /// comparison. 0/1 are fully shadowed / unshadowed.
+    int replaceCubeDref = -1;
+
     /// Float control flags
     DxbcFloatControlFlags floatControl;
 

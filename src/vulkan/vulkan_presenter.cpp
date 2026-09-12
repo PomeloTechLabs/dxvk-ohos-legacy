@@ -1,6 +1,7 @@
 #include "vulkan_presenter.h"
 
 #if defined(DXVK_NATIVE_OHOS)
+#include <native_buffer/buffer_common.h>
 #include <native_window/external_window.h>
 #include <optional>
 #endif
@@ -9,6 +10,33 @@
 #include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk::vk {
+
+#if defined(DXVK_NATIVE_OHOS)
+  static VkResult configureOhosNativeBuffers(OHNativeWindow* window, int32_t width, int32_t height) {
+    if (!window || width <= 0 || height <= 0)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    const int geometryStatus = OH_NativeWindow_NativeWindowHandleOpt(
+      window, SET_BUFFER_GEOMETRY, width, height);
+    if (geometryStatus != 0)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    // XComponent/NativeWindow must match the RGBA present path. Leaving the
+    // default format (often BGRA) while DXVK prefers RGBA swaps red and yellow.
+    const int formatStatus = OH_NativeWindow_NativeWindowHandleOpt(
+      window, SET_FORMAT, static_cast<int32_t>(NATIVEBUFFER_PIXEL_FMT_RGBA_8888));
+    if (formatStatus != 0)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    int32_t actualFormat = -1;
+    OH_NativeWindow_NativeWindowHandleOpt(window, GET_FORMAT, &actualFormat);
+    Logger::info(str::format(
+      "Presenter: OpenHarmony native buffer ", width, "x", height,
+      " format=", actualFormat, " rgba8888=",
+      static_cast<int32_t>(NATIVEBUFFER_PIXEL_FMT_RGBA_8888)));
+    return VK_SUCCESS;
+  }
+#endif
 
   template<typename T>
   static uint64_t winehuaHandleValue(T handle) {
@@ -47,13 +75,11 @@ namespace dxvk::vk {
           throw DxvkError("Native OpenHarmony window is not drawable");
         const auto bufferExtent = desc.imageExtent.width && desc.imageExtent.height
           ? desc.imageExtent : VkExtent2D { lease.width(), lease.height() };
-        const int geometryStatus = OH_NativeWindow_NativeWindowHandleOpt(
-          static_cast<OHNativeWindow*>(lease.nativeWindow()), SET_BUFFER_GEOMETRY,
-          static_cast<int32_t>(bufferExtent.width),
-          static_cast<int32_t>(bufferExtent.height));
-        if (geometryStatus != 0)
-          throw DxvkError(str::format(
-            "Failed to configure OpenHarmony native buffer geometry: ", geometryStatus));
+        if (configureOhosNativeBuffers(
+              static_cast<OHNativeWindow*>(lease.nativeWindow()),
+              static_cast<int32_t>(bufferExtent.width),
+              static_cast<int32_t>(bufferExtent.height)) != VK_SUCCESS)
+          throw DxvkError("Failed to configure OpenHarmony native buffer geometry/format");
         Logger::info(str::format(
           "Presenter: OpenHarmony buffer geometry: display=",
           lease.width(), "x", lease.height(), " buffer=",
@@ -214,12 +240,13 @@ namespace dxvk::vk {
       m_windowRevision = lease.revision();
       return VK_SUCCESS;
     }
-    if (replaceSwapchain && desc.imageExtent.width && desc.imageExtent.height) {
-      const int geometryStatus = OH_NativeWindow_NativeWindowHandleOpt(
-        static_cast<OHNativeWindow*>(lease.nativeWindow()), SET_BUFFER_GEOMETRY,
-        static_cast<int32_t>(desc.imageExtent.width),
-        static_cast<int32_t>(desc.imageExtent.height));
-      if (geometryStatus != 0)
+    {
+      const VkExtent2D bufferExtent = desc.imageExtent.width && desc.imageExtent.height
+        ? desc.imageExtent : VkExtent2D { lease.width(), lease.height() };
+      if (configureOhosNativeBuffers(
+            static_cast<OHNativeWindow*>(lease.nativeWindow()),
+            static_cast<int32_t>(bufferExtent.width),
+            static_cast<int32_t>(bufferExtent.height)) != VK_SUCCESS)
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     #endif

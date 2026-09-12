@@ -3651,6 +3651,27 @@ namespace dxvk {
     auto& texture = m_textures.at(textureReg.idx[0].offset);
     auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
     const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
+    const bool isDepthCompare = ins.op == DxbcOpcode::SampleC
+                             || ins.op == DxbcOpcode::SampleClz;
+    const bool replaceCubeDref =
+      isDepthCompare
+      && m_moduleInfo.options.replaceCubeDref >= 0
+      && m_programInfo.type() == DxbcProgramType::PixelShader
+      && texture.imageInfo.dim == spv::DimCube
+      && !texture.imageInfo.array;
+
+    DxbcRegisterValue result;
+    result.type.ctype  = texture.sampledType;
+    result.type.ccount = isDepthCompare ? 1 : 4;
+
+    if (replaceCubeDref) {
+      result.id = m_module.constf32(
+        m_moduleInfo.options.replaceCubeDref > 0 ? 1.0f : 0.0f);
+      Logger::info(str::format(
+        "WineHua: Cube Dref omitted t", textureReg.idx[0].offset,
+        " op=", ins.op == DxbcOpcode::SampleClz ? "sampleclz" : "samplec",
+        " replace=", m_moduleInfo.options.replaceCubeDref));
+    } else {
     
     // Load the texture coordinates. SPIR-V allows these
     // to be float4 even if not all components are used.
@@ -3661,8 +3682,6 @@ namespace dxvk {
       coord = emitCubeArrayTo2DArrayCoord(coord);
     
     // Load reference value for depth-compare operations
-    const bool isDepthCompare = ins.op == DxbcOpcode::SampleC
-                             || ins.op == DxbcOpcode::SampleClz;
     
     const DxbcRegisterValue referenceValue = isDepthCompare
       ? emitRegisterLoad(ins.src[3], DxbcRegMask(true, false, false, false))
@@ -3720,12 +3739,6 @@ namespace dxvk {
     
     // Combine the texture and the sampler into a sampled image
     uint32_t sampledImageId = emitLoadSampledImage(texture, sampler, isDepthCompare);
-    
-    // Sampling an image always returns a four-component
-    // vector, whereas depth-compare ops return a scalar.
-    DxbcRegisterValue result;
-    result.type.ctype  = texture.sampledType;
-    result.type.ccount = isDepthCompare ? 1 : 4;
     
     switch (ins.op) {
       // Simple image sample operation
@@ -3803,6 +3816,7 @@ namespace dxvk {
       result = emitCustomBorderColorCorrection(
         result, coord, textureReg, texture,
         samplerReg.idx[0].offset, lod);
+    }
     }
     
     // Swizzle components using the texture swizzle

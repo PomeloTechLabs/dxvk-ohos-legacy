@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 
@@ -99,6 +100,13 @@ namespace dxvk {
       specData.set(getSpecId(i), state.sc.specConstants[i], 0u);
 
     VkSpecializationInfo specInfo = specData.getSpecInfo();
+
+    std::lock_guard<dxvk::mutex> pipelineCompileLock(
+      m_pipeMgr->m_pipelineCompileMutex);
+    const uint64_t pipelineSequence =
+      m_pipeMgr->m_pipelineCreateSequence.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    const bool tracePipeline = winehuaPipelineTraceEnabled();
     
     DxvkShaderModuleCreateInfo moduleInfo;
     moduleInfo.fsDualSrcBlend = false;
@@ -125,9 +133,33 @@ namespace dxvk {
     
     winehuaFlowTrace("compute-pipeline vkCreate begin");
 
+    if (tracePipeline) {
+      winehuaPipelineTraceEmit(str::format(
+        "WineHuaPipelineCreate: phase=begin sequence=", pipelineSequence,
+        " type=compute profile=", winehuaDiagnosticProfile(),
+        " cs=", m_shaders.cs->debugName(),
+        " bindings=", m_layout->bindingCount(),
+        " specCount=", specInfo.mapEntryCount,
+        " specDataBytes=", specInfo.dataSize,
+        " specHash=0x", std::hex, winehuaSpecializationHash(specInfo),
+        " spirvHash=0x", csm.winehuaCodeHash(),
+        " spirvBytes=", std::dec, csm.winehuaCodeSize(),
+        " resources=", m_shaders.cs->info().resourceSlotCount,
+        " inputMask=0x", std::hex, m_shaders.cs->info().inputMask,
+        " outputMask=0x", m_shaders.cs->info().outputMask));
+    }
+
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateComputePipelines(m_vkd->device(),
-          m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
+    const VkResult pipelineStatus = m_vkd->vkCreateComputePipelines(
+      m_vkd->device(), m_pipeMgr->m_cache->handle(),
+      1, &info, nullptr, &pipeline);
+    if (tracePipeline) {
+      winehuaPipelineTraceEmit(str::format(
+        "WineHuaPipelineCreate: phase=end sequence=", pipelineSequence,
+        " type=compute result=", int32_t(pipelineStatus),
+        " pipeline=0x", std::hex, pipeline));
+    }
+    if (pipelineStatus != VK_SUCCESS) {
       Logger::err("DxvkComputePipeline: Failed to compile pipeline");
       Logger::err(str::format("  cs  : ", m_shaders.cs->debugName()));
       return VK_NULL_HANDLE;

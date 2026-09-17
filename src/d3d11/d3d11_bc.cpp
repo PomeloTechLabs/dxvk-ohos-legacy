@@ -5,6 +5,8 @@
 
 #include "d3d11_bc.h"
 
+#include "../util/etcpak/ProcessRGB.hpp"
+
 /* Standalone MIT-licensed BC decoder copied into the native DXVK source.
  * This is decoder code only: it has no Wine runtime, ABI, loader, process,
  * Broker, or IPC dependency. WINE_UNUSED enables the BC6H/BC7 routines. */
@@ -119,10 +121,85 @@ namespace dxvk {
       return true;
     }
 
+    /* Packed 16-bit targets halve the decoded footprint of colour textures on
+     * drivers without BC support.  Alpha survives in the 4444 layout, which is
+     * what the alpha-tested foliage and UI textures need. */
+    uint32_t PackedPixelBytes(VkFormat targetFormat) {
+      switch (targetFormat) {
+        case VK_FORMAT_B5G6R5_UNORM_PACK16:
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+          return 2;
+        default:
+          return 0;
+      }
+    }
+
+    uint16_t PackRgb565(const uint8_t* rgba) {
+      const uint16_t r = uint16_t(rgba[0] >> 3);
+      const uint16_t g = uint16_t(rgba[1] >> 2);
+      const uint16_t b = uint16_t(rgba[2] >> 3);
+      return uint16_t((r << 11) | (g << 5) | b);
+    }
+
+    uint16_t PackBgra4444(const uint8_t* rgba) {
+      const uint16_t r = uint16_t(rgba[0] >> 4);
+      const uint16_t g = uint16_t(rgba[1] >> 4);
+      const uint16_t b = uint16_t(rgba[2] >> 4);
+      const uint16_t a = uint16_t(rgba[3] >> 4);
+      return uint16_t((b << 12) | (g << 8) | (r << 4) | a);
+    }
+
+    uint16_t PackRgba4444(const uint8_t* rgba) {
+      const uint16_t r = uint16_t(rgba[0] >> 4);
+      const uint16_t g = uint16_t(rgba[1] >> 4);
+      const uint16_t b = uint16_t(rgba[2] >> 4);
+      const uint16_t a = uint16_t(rgba[3] >> 4);
+      return uint16_t((a << 12) | (b << 8) | (g << 4) | r);
+    }
+
+    /* Block-compressed targets the device does support, used when the driver
+     * has no BC at all: the decoded RGBA block is re-encoded with etcpak. */
+    enum class Etc2Target {
+      None,
+      Rgb,        // ETC2 R8G8B8        - 8 bytes per block
+      Rgba,       // ETC2 R8G8B8A8      - 16 bytes per block
+      EacR,       // EAC  R11           - 8 bytes per block
+      EacRg,      // EAC  R11G11        - 16 bytes per block
+    };
+
+    Etc2Target GetEtc2Target(VkFormat targetFormat) {
+      switch (targetFormat) {
+        case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
+        case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
+          return Etc2Target::Rgb;
+        case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
+        case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+          return Etc2Target::Rgba;
+        case VK_FORMAT_EAC_R11_UNORM_BLOCK:
+          return Etc2Target::EacR;
+        case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
+          return Etc2Target::EacRg;
+        default:
+          return Etc2Target::None;
+      }
+    }
+
+    uint32_t Etc2BlockBytes(Etc2Target target) {
+      switch (target) {
+        case Etc2Target::Rgb:   return 8;
+        case Etc2Target::Rgba:  return 16;
+        case Etc2Target::EacR:  return 8;
+        case Etc2Target::EacRg: return 16;
+        default:                return 0;
+      }
+    }
+
   }
 
   bool DecodeD3D11BcImage(
           VkFormat                 format,
+          VkFormat                 targetFormat,
           VkExtent3D               extent,
     const void*                    source,
           VkDeviceSize             sourceRowPitch,
@@ -132,6 +209,16 @@ namespace dxvk {
     if (!info.blockBytes || !info.pixelBytes || !source
      || !extent.width || !extent.height || !extent.depth)
       return false;
+
+    /* Only the four-byte colour formats carry RGBA data that can be packed
+     * into a 16-bit target; RGTC and BC6H keep their own layouts. */
+    const bool packable = info.pixelBytes == 4;
+    const uint32_t packedBytes = packable ? PackedPixelBytes(targetFormat) : 0;
+    const Etc2Target etc2Target = packable
+      ? GetEtc2Target(targetFormat) : Etc2Target::None;
+    const uint32_t etc2Bytes = Etc2BlockBytes(etc2Target);
+    const uint32_t outputPixelBytes = etc2Bytes ? 4
+      : (packedBytes ? packedBytes : info.pixelBytes);
 
     const uint32_t blocksX = (extent.width + 3) / 4;
     const uint32_t blocksY = (extent.height + 3) / 4;
@@ -147,8 +234,13 @@ namespace dxvk {
     if (sourceSlicePitch < minimumSlicePitch)
       return false;
 
+    /* etcpak walks whole rows, so the intermediate RGBA image is padded to a
+     * multiple of the block size. */
+    const uint32_t paddedWidth = etc2Bytes ? blocksX * 4u : extent.width;
+    const VkExtent3D outputExtent = { paddedWidth, extent.height, extent.depth };
+
     size_t totalSize = 0;
-    if (!ComputeOutputSize(extent, info.pixelBytes,
+    if (!ComputeOutputSize(outputExtent, outputPixelBytes,
                            result.rowPitch, result.slicePitch, totalSize))
       return false;
     result.data.assign(totalSize, 0);
@@ -186,12 +278,75 @@ namespace dxvk {
           const uint32_t copyWidth = std::min(4u, extent.width - blockX * 4);
           const uint32_t copyHeight = std::min(4u, extent.height - blockY * 4);
           for (uint32_t y = 0; y < copyHeight; y++) {
-            std::memcpy(targetSlice
-                          + (blockY * 4 + y) * result.rowPitch
-                          + blockX * 4 * info.pixelBytes,
-                        block + y * 4 * info.pixelBytes,
-                        copyWidth * info.pixelBytes);
+            uint8_t* targetRow = targetSlice
+              + (blockY * 4 + y) * result.rowPitch
+              + blockX * 4 * outputPixelBytes;
+            if (packedBytes) {
+              auto* packed = reinterpret_cast<uint16_t*>(targetRow);
+              for (uint32_t x = 0; x < copyWidth; x++) {
+                const uint8_t* rgba = block + (y * 4 + x) * 4;
+                switch (targetFormat) {
+                  case VK_FORMAT_B5G6R5_UNORM_PACK16:
+                    packed[x] = PackRgb565(rgba);
+                    break;
+                  case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+                    packed[x] = PackRgba4444(rgba);
+                    break;
+                  default:
+                    packed[x] = PackBgra4444(rgba);
+                    break;
+                }
+              }
+            } else if (etc2Bytes) {
+              /* etcpak's ETC/EAC encoders take BGRA input (its CLI passes
+               * bgr=true for those codecs), while the BC decoders we use emit
+               * RGBA, so the red and blue channels are swapped here. */
+              for (uint32_t x = 0; x < copyWidth; x++) {
+                const uint8_t* rgba = block + (y * 4 + x) * 4;
+                uint8_t* dst = targetRow + x * 4;
+                dst[0] = rgba[2];
+                dst[1] = rgba[1];
+                dst[2] = rgba[0];
+                dst[3] = rgba[3];
+              }
+            } else {
+              std::memcpy(targetRow,
+                          block + y * 4 * info.pixelBytes,
+                          copyWidth * info.pixelBytes);
+            }
           }
+        }
+      }
+    }
+
+    if (etc2Bytes) {
+      /* Re-encode the decoded pixels with the device-supported block format. */
+      std::vector<uint8_t> decoded = std::move(result.data);
+      const VkDeviceSize decodedSlicePitch = result.slicePitch;
+      result.rowPitch = VkDeviceSize(blocksX) * etc2Bytes;
+      result.slicePitch = result.rowPitch * blocksY;
+      result.data.assign(size_t(result.slicePitch) * extent.depth, 0);
+
+      for (uint32_t z = 0; z < extent.depth; z++) {
+        const auto* src = reinterpret_cast<const uint32_t*>(
+          decoded.data() + z * decodedSlicePitch);
+        auto* dst = reinterpret_cast<uint64_t*>(
+          result.data.data() + z * result.slicePitch);
+        const uint32_t blocks = blocksX * blocksY;
+
+        switch (etc2Target) {
+          case Etc2Target::Rgb:
+            CompressEtc2Rgb(src, dst, blocks, paddedWidth, true);
+            break;
+          case Etc2Target::Rgba:
+            CompressEtc2Rgba(src, dst, blocks, paddedWidth, true);
+            break;
+          case Etc2Target::EacR:
+            CompressEacR(src, dst, blocks, paddedWidth);
+            break;
+          default:
+            CompressEacRg(src, dst, blocks, paddedWidth);
+            break;
         }
       }
     }

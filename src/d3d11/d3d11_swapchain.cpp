@@ -5,9 +5,11 @@
 #if defined(DXVK_NATIVE_OHOS)
 #include "../dxgi/dxgi_ohos_swapchain.h"
 #include "../wsi/ohos_present_policy.h"
+#include "../dxvk/dxvk_ohos_memory_stats.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #endif
 
 #if defined(DXVK_NATIVE_OHOS)
@@ -320,6 +322,37 @@ namespace dxvk {
 
       const auto options = m_parent->GetOptions();
       if (options->syncInterval >= 0) SyncInterval = options->syncInterval;
+
+      /* Bounded GPU-memory attribution: every few seconds report what DXVK's
+       * own allocator holds versus what the driver reports for the heap, so a
+       * runaway footprint can be attributed without an external profiler. */
+      {
+        static std::chrono::steady_clock::time_point sLastReport;
+        const auto now = std::chrono::steady_clock::now();
+        if (sLastReport == std::chrono::steady_clock::time_point()
+         || now - sLastReport >= std::chrono::seconds(5)) {
+          sLastReport = now;
+          DxvkAdapterMemoryInfo heapInfo = m_device->adapter()->getMemoryHeapInfo();
+          Logger::info(str::format("WineHuaMemory: imagesMiB=",
+            uint64_t(ohosImageBytes().load(std::memory_order_relaxed) >> 20),
+            " images=", uint64_t(ohosImageCount().load(std::memory_order_relaxed)),
+            " largeImagesMiB=",
+            uint64_t(ohosLargeImageBytes().load(std::memory_order_relaxed) >> 20),
+            " largeImages=", uint64_t(ohosLargeImageCount().load(std::memory_order_relaxed)),
+            " buffersMiB=",
+            uint64_t(ohosBufferBytes().load(std::memory_order_relaxed) >> 20),
+            " buffers=", uint64_t(ohosBufferCount().load(std::memory_order_relaxed))));
+          for (uint32_t i = 0; i < heapInfo.heapCount; i++) {
+            DxvkMemoryStats stats = m_device->getMemoryStats(i);
+            Logger::info(str::format("WineHuaMemory: heap=", i,
+              " flags=", uint32_t(heapInfo.heaps[i].heapFlags),
+              " dxvkAllocatedMiB=", uint64_t(stats.memoryAllocated >> 20),
+              " dxvkUsedMiB=", uint64_t(stats.memoryUsed >> 20),
+              " driverUsageMiB=", uint64_t(heapInfo.heaps[i].memoryAllocated >> 20),
+              " driverBudgetMiB=", uint64_t(heapInfo.heaps[i].memoryBudget >> 20)));
+          }
+        }
+      }
       const bool vsync = SyncInterval != 0;
       m_dirty |= vsync != m_vsync;
       m_vsync = vsync;

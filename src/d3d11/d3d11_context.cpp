@@ -4049,7 +4049,7 @@ namespace dxvk {
     }
 
     const bool bcEmulated = formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
-                         && !pDstTexture->GetImage()->formatInfo()->flags.test(DxvkFormatFlag::BlockCompressed);
+                         && pDstTexture->GetImage()->info().format != packedFormat;
     const bool snormRtEmulated = pDstTexture->IsRgba8SnormRtEmulated();
     const bool traceAlpha = subresource.mipLevel == 0
       && formatInfo->elementSize == 4
@@ -4065,7 +4065,8 @@ namespace dxvk {
         ? ConvertD3D11Rgba8SnormToRgba16Float(
             extent, pSrcData, SrcRowPitch, SrcDepthPitch, converted)
         : DecodeD3D11BcImage(
-            packedFormat, extent, pSrcData, SrcRowPitch, SrcDepthPitch, converted);
+            packedFormat, pDstTexture->GetImage()->info().format, extent,
+            pSrcData, SrcRowPitch, SrcDepthPitch, converted);
 
       if (!convertedOk) {
         Logger::err(snormRtEmulated

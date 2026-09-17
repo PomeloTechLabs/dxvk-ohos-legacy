@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "../util/log/log.h"
@@ -486,6 +488,87 @@ namespace dxvk {
     Logger::info("WineHuaFlow: " + message);
   }
 
+  inline bool winehuaPipelineTraceEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_WINEHUA_TRACE_PIPELINES");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  inline void winehuaPipelineTraceEmit(const std::string& message) {
+    Logger::info(message);
+
+    const char* path = std::getenv("DXVK_WINEHUA_TRACE_PIPELINES_PATH");
+    const char* mirrorPath = std::getenv(
+      "DXVK_WINEHUA_TRACE_PIPELINES_MIRROR_PATH");
+    if ((!path || !path[0]) && (!mirrorPath || !mirrorPath[0]))
+      return;
+
+    static std::mutex fileMutex;
+    static uint32_t recordCount = 0;
+    std::lock_guard<std::mutex> lock(fileMutex);
+    uint32_t maxRecords = 8192;
+    if (const char* value = std::getenv("DXVK_WINEHUA_PIPELINE_TRACE_MAX")) {
+      char* end = nullptr;
+      const unsigned long parsed = std::strtoul(value, &end, 10);
+      if (end != value && *end == '\0' && parsed >= 128 && parsed <= 65536)
+        maxRecords = static_cast<uint32_t>(parsed);
+    }
+
+    bool wroteRecord = false;
+    const auto writeRecord = [&](const char* target) {
+      if (!target || !target[0])
+        return;
+      if (path && path[0] && target != path && !std::strcmp(target, path))
+        return;
+      if (recordCount >= maxRecords) {
+        if (std::FILE* rollover = std::fopen(target, "w")) {
+          std::fprintf(rollover,
+            "WineHuaPipelineTrace: ring-rollover maxRecords=%u\n", maxRecords);
+          std::fclose(rollover);
+        }
+      }
+      if (std::FILE* file = std::fopen(target, "a")) {
+        std::fwrite(message.data(), 1, message.size(), file);
+        std::fputc('\n', file);
+        std::fclose(file);
+        wroteRecord = true;
+      }
+    };
+
+    writeRecord(path);
+    writeRecord(mirrorPath);
+    if (wroteRecord)
+      ++recordCount;
+    if (recordCount >= maxRecords)
+      recordCount = 0;
+  }
+
+  inline const char* winehuaDiagnosticProfile() {
+    const char* value = std::getenv("GTAV_OHOS_DIAGNOSTIC_PROFILE");
+    return value && value[0] ? value : "none";
+  }
+
+  inline uint64_t winehuaSpecializationHash(const VkSpecializationInfo& info) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t i = 0; i < info.mapEntryCount; i++) {
+      const VkSpecializationMapEntry& entry = info.pMapEntries[i];
+      hash ^= entry.constantID;
+      hash *= 1099511628211ull;
+      hash ^= entry.size;
+      hash *= 1099511628211ull;
+      if (entry.offset + entry.size <= info.dataSize && info.pData) {
+        const auto* bytes = static_cast<const uint8_t*>(info.pData) + entry.offset;
+        for (size_t j = 0; j < entry.size; j++) {
+          hash ^= bytes[j];
+          hash *= 1099511628211ull;
+        }
+      }
+    }
+    return hash;
+  }
+
 #define winehuaQueryTrace(message)                                              \
   do {                                                                          \
     if (winehuaQueryTraceAllow())                                               \
@@ -556,6 +639,73 @@ namespace dxvk {
       const char* value = std::getenv(
         "WINEHUA_DXVK_FORCE_HEAVEN_PASS2_DEPTH_ALWAYS");
       return value && value[0] == '1';
+    }();
+    return enabled;
+  }
+
+  /* Huawei's Vulkan compiler can fault while lowering a D32S8 pipeline that
+   * combines four BGRA MRTs with stencil testing.  The same shader succeeds
+   * when the stencil stage is omitted; depth remains available for ordering.
+   * Keep this narrow workaround enabled for the native OHOS target only. */
+  inline bool winehuaAvoidD32S8MrtStencil() {
+#if defined(DXVK_NATIVE_OHOS)
+    /* The workaround hides the stencil classification the deferred lighting
+     * reads, so it has to stay switchable for A/B diagnosis: the launcher can
+     * request the original stencil state with DXVK_WINEHUA_AVOID_D32S8_MRT_STENCIL=0. */
+    const char* value = std::getenv("DXVK_WINEHUA_AVOID_D32S8_MRT_STENCIL");
+    if (value && value[0] == '0' && value[1] == '\0')
+      return false;
+    return true;
+#else
+    const char* value = std::getenv("DXVK_WINEHUA_AVOID_D32S8_MRT_STENCIL");
+    return value && value[0] == '1' && value[1] == '\0';
+#endif
+  }
+
+  inline bool winehuaSkipKnownD32S8MrtPipeline() {
+#if defined(DXVK_NATIVE_OHOS)
+    const char* value = std::getenv("DXVK_WINEHUA_SKIP_KNOWN_D32S8_MRT");
+    return !value || (value[0] == '1' && value[1] == '\0');
+#else
+    const char* value = std::getenv("DXVK_WINEHUA_SKIP_KNOWN_D32S8_MRT");
+    return value && value[0] == '1' && value[1] == '\0';
+#endif
+  }
+
+  /* Opt-in isolation switches for the r304 foliage pipeline investigation.
+   * They narrow the DXVK-side rewrites that the crashing Maleoon pipeline is
+   * subject to, are read once from the process environment, are never
+   * persisted, and default to the behavior the product already ships. */
+  inline bool winehuaDropSampleMaskOutput() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_WINEHUA_DROP_SAMPLE_MASK_OUTPUT");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  inline bool winehuaDisableA2cSingleSample() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_WINEHUA_DISABLE_A2C_SINGLE_SAMPLE");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  /* Rewrites per-sample interpolant reads (InterpolateAtSample) into ordinary
+   * input reads for pipelines with a single rasterization sample, where the two
+   * are equivalent.  Opt-in so the default product path stays untouched. */
+  inline bool winehuaReplaceSingleSampleInterpolation() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DXVK_WINEHUA_SINGLE_SAMPLE_INTERPOLATION");
+      #if defined(DXVK_NATIVE_OHOS)
+      // Default for the native OHOS target: the affected Maleoon driver faults
+      // while compiling a single-sample foliage shader that reads interpolants
+      // per sample, and the replacement is value-identical at one sample.
+      if (!value)
+        return true;
+      #endif
+      return value && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
   }

@@ -178,7 +178,7 @@ namespace dxvk {
             D3D11CpuImage converted;
 
             const bool bcEmulated = formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
-                                 && !image->formatInfo()->flags.test(DxvkFormatFlag::BlockCompressed);
+                                 && image->info().format != packedFormat;
             const bool snormRtEmulated = pTexture->IsRgba8SnormRtEmulated();
             if (snormRtEmulated) {
               if (!ConvertD3D11Rgba8SnormToRgba16Float(
@@ -189,7 +189,8 @@ namespace dxvk {
               uploadRowPitch = converted.rowPitch;
               uploadSlicePitch = converted.slicePitch;
             } else if (bcEmulated) {
-              if (!DecodeD3D11BcImage(packedFormat, mipLevelExtent,
+              if (!DecodeD3D11BcImage(packedFormat, image->info().format,
+                                      mipLevelExtent,
                                       uploadData, uploadRowPitch, uploadSlicePitch,
                                       converted))
                 throw DxvkError("WineHua: Failed to decompress initial BC texture data");

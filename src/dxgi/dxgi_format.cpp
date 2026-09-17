@@ -908,27 +908,79 @@ namespace dxvk {
         RemapColorFormat(format, target, identity);
       };
 
-      remap(DXGI_FORMAT_BC1_TYPELESS,   VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC1_UNORM,      VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC1_UNORM_SRGB, VK_FORMAT_R8G8B8A8_SRGB);
-      remap(DXGI_FORMAT_BC2_TYPELESS,   VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC2_UNORM,      VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC2_UNORM_SRGB, VK_FORMAT_R8G8B8A8_SRGB);
-      remap(DXGI_FORMAT_BC3_TYPELESS,   VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC3_UNORM,      VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC3_UNORM_SRGB, VK_FORMAT_R8G8B8A8_SRGB);
-      remap(DXGI_FORMAT_BC4_TYPELESS,   VK_FORMAT_R8_UNORM);
-      remap(DXGI_FORMAT_BC4_UNORM,      VK_FORMAT_R8_UNORM);
+      /* Backing format for the unsupported BC colour textures.  "rgba8" keeps
+       * the decoded pixels losslessly (default); "packed16" halves the
+       * footprint of linear colour textures by packing them into a 16-bit
+       * layout, which trades gradient banding for memory.  The switch is
+       * process-local and only affects upload-time decoding. */
+      const std::string backingMode = env::getEnvVar("WINEHUA_DXVK_BC_BACKING");
+      /* Bisection helpers for the ETC2 path: colour textures and the two
+       * single/two-channel (normal, height, AO) textures can be enabled
+       * separately to isolate visual regressions. */
+      const bool wantEtc2Color = backingMode == "etc2"
+        || backingMode == "etc2color" || backingMode == "etc2eac"
+        || backingMode == "etc2nosrgb";
+      /* "etc2nosrgb" applies ETC2 only to linear colour textures; sRGB
+       * textures keep their 8-bit layout, which isolates the sRGB block
+       * formats from the rest of the transcode. */
+      const bool allowEtc2Srgb = backingMode != "etc2nosrgb";
+      const bool wantEtc2Eac = backingMode == "etc2" || backingMode == "etc2eac";
+      const VkFormatProperties packedProperties =
+        adapter->formatProperties(VK_FORMAT_B4G4R4A4_UNORM_PACK16);
+      const bool packed16Allowed = backingMode == "packed16"
+        && (packedProperties.optimalTilingFeatures
+              & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+
+      /* "etc2" re-encodes the decoded pixels into a block format the device
+       * does support, keeping the footprint close to the original BC data and
+       * preserving sRGB through the matching sRGB block formats. */
+      const auto supportsSampled = [adapter](VkFormat format) {
+        return (adapter->formatProperties(format).optimalTilingFeatures
+          & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+      };
+      const bool etc2Allowed = wantEtc2Color
+        && supportsSampled(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK)
+        && supportsSampled(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
+      const bool etc2SrgbAllowed = etc2Allowed && allowEtc2Srgb;
+      const bool eacAllowed = wantEtc2Eac
+        && supportsSampled(VK_FORMAT_EAC_R11_UNORM_BLOCK)
+        && supportsSampled(VK_FORMAT_EAC_R11G11_UNORM_BLOCK);
+
+      const VkFormat colorBacking = etc2Allowed
+        ? VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
+        : (packed16Allowed ? VK_FORMAT_B4G4R4A4_UNORM_PACK16
+                           : VK_FORMAT_R8G8B8A8_UNORM);
+
+      const VkFormat colorBackingSrgb = etc2Allowed
+        ? (etc2SrgbAllowed ? VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK
+                           : VK_FORMAT_R8G8B8A8_SRGB)
+        : VK_FORMAT_R8G8B8A8_SRGB;
+
+      remap(DXGI_FORMAT_BC1_TYPELESS,   colorBacking);
+      remap(DXGI_FORMAT_BC1_UNORM,      colorBacking);
+      remap(DXGI_FORMAT_BC1_UNORM_SRGB, colorBackingSrgb);
+      remap(DXGI_FORMAT_BC2_TYPELESS,   colorBacking);
+      remap(DXGI_FORMAT_BC2_UNORM,      colorBacking);
+      remap(DXGI_FORMAT_BC2_UNORM_SRGB, colorBackingSrgb);
+      remap(DXGI_FORMAT_BC3_TYPELESS,   colorBacking);
+      remap(DXGI_FORMAT_BC3_UNORM,      colorBacking);
+      remap(DXGI_FORMAT_BC3_UNORM_SRGB, colorBackingSrgb);
+      remap(DXGI_FORMAT_BC4_TYPELESS,   eacAllowed
+        ? VK_FORMAT_EAC_R11_UNORM_BLOCK : VK_FORMAT_R8_UNORM);
+      remap(DXGI_FORMAT_BC4_UNORM,      eacAllowed
+        ? VK_FORMAT_EAC_R11_UNORM_BLOCK : VK_FORMAT_R8_UNORM);
       remap(DXGI_FORMAT_BC4_SNORM,      VK_FORMAT_R8_SNORM);
-      remap(DXGI_FORMAT_BC5_TYPELESS,   VK_FORMAT_R8G8_UNORM);
-      remap(DXGI_FORMAT_BC5_UNORM,      VK_FORMAT_R8G8_UNORM);
+      remap(DXGI_FORMAT_BC5_TYPELESS,   eacAllowed
+        ? VK_FORMAT_EAC_R11G11_UNORM_BLOCK : VK_FORMAT_R8G8_UNORM);
+      remap(DXGI_FORMAT_BC5_UNORM,      eacAllowed
+        ? VK_FORMAT_EAC_R11G11_UNORM_BLOCK : VK_FORMAT_R8G8_UNORM);
       remap(DXGI_FORMAT_BC5_SNORM,      VK_FORMAT_R8G8_SNORM);
       remap(DXGI_FORMAT_BC6H_TYPELESS,  VK_FORMAT_R16G16B16A16_SFLOAT);
       remap(DXGI_FORMAT_BC6H_UF16,      VK_FORMAT_R16G16B16A16_SFLOAT);
       remap(DXGI_FORMAT_BC6H_SF16,      VK_FORMAT_R16G16B16A16_SFLOAT);
-      remap(DXGI_FORMAT_BC7_TYPELESS,   VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC7_UNORM,      VK_FORMAT_R8G8B8A8_UNORM);
-      remap(DXGI_FORMAT_BC7_UNORM_SRGB, VK_FORMAT_R8G8B8A8_SRGB);
+      remap(DXGI_FORMAT_BC7_TYPELESS,   colorBacking);
+      remap(DXGI_FORMAT_BC7_UNORM,      colorBacking);
+      remap(DXGI_FORMAT_BC7_UNORM_SRGB, colorBackingSrgb);
 
       const DXGI_VK_FORMAT_FAMILY rgba8Family = {
         VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB };
@@ -950,6 +1002,16 @@ namespace dxvk {
         VK_FORMAT_R8G8_SNORM };
       const DXGI_VK_FORMAT_FAMILY rgba16fFamily = {
         VK_FORMAT_R16G16B16A16_SFLOAT };
+      const DXGI_VK_FORMAT_FAMILY packed16Family = {
+        VK_FORMAT_B4G4R4A4_UNORM_PACK16 };
+      const DXGI_VK_FORMAT_FAMILY etc2Family = {
+        VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK };
+      const DXGI_VK_FORMAT_FAMILY etc2SrgbFamily = {
+        VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK };
+      const DXGI_VK_FORMAT_FAMILY eacR11Family = {
+        VK_FORMAT_EAC_R11_UNORM_BLOCK };
+      const DXGI_VK_FORMAT_FAMILY eacR11G11Family = {
+        VK_FORMAT_EAC_R11G11_UNORM_BLOCK };
 
       for (DXGI_FORMAT format : {
              DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB,
@@ -971,14 +1033,37 @@ namespace dxvk {
       for (DXGI_FORMAT format : {
              DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM,
              DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC7_UNORM })
-        m_dxgiFamilies[uint32_t(format)] = rgba8UnormFamily;
+        m_dxgiFamilies[uint32_t(format)] = etc2Allowed ? etc2Family
+          : (packed16Allowed ? packed16Family : rgba8UnormFamily);
 
       for (DXGI_FORMAT format : {
              DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC2_UNORM_SRGB,
              DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC7_UNORM_SRGB })
-        m_dxgiFamilies[uint32_t(format)] = rgba8SrgbFamily;
+        m_dxgiFamilies[uint32_t(format)] = etc2SrgbAllowed
+          ? etc2SrgbFamily : rgba8SrgbFamily;
 
-      Logger::info("WineHua: BC1-BC7 upload-time decompression enabled");
+      for (DXGI_FORMAT format : {
+             DXGI_FORMAT_BC4_TYPELESS, DXGI_FORMAT_BC4_UNORM })
+        m_dxgiFamilies[uint32_t(format)] = eacAllowed
+          ? eacR11Family : r8UnormFamily;
+
+      for (DXGI_FORMAT format : {
+             DXGI_FORMAT_BC5_TYPELESS, DXGI_FORMAT_BC5_UNORM })
+        m_dxgiFamilies[uint32_t(format)] = eacAllowed
+          ? eacR11G11Family : rg8UnormFamily;
+
+      Logger::info(str::format("WineHua: BC1-BC7 upload-time decompression enabled",
+        " backing=", etc2Allowed ? "etc2"
+          : (packed16Allowed ? "packed16" : "rgba8"),
+        " requested=", backingMode.empty() ? "default" : backingMode.c_str(),
+        " etc2Sampled=", uint32_t(etc2Allowed),
+        " etc2Srgb=", uint32_t(etc2SrgbAllowed),
+        " eacSampled=", uint32_t(eacAllowed),
+        " packed4444Sampled=", uint32_t(
+          (packedProperties.optimalTilingFeatures
+            & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0),
+        " etc2=", uint32_t(adapter->features().core.features.textureCompressionETC2),
+        " astcLdr=", uint32_t(adapter->features().core.features.textureCompressionASTC_LDR)));
     }
 
     if (!adapter->features().ext4444Formats.formatA4R4G4B4) {

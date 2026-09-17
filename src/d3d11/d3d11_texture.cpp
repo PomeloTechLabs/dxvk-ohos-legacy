@@ -119,8 +119,12 @@ namespace dxvk {
     // be reinterpreted in Vulkan, so we'll ignore those.
     auto formatProperties = imageFormatInfo(formatInfo.Format);
     auto packedProperties = imageFormatInfo(m_packedFormat);
+    /* The D3D-visible format is BC but the backing image is not that same
+     * format: either an uncompressed fallback or a different block format the
+     * device supports (ETC2/EAC).  Comparing formats instead of flags keeps
+     * the decoded backings detected. */
     const bool isBcEmulated = packedProperties->flags.test(DxvkFormatFlag::BlockCompressed)
-                           && !formatProperties->flags.test(DxvkFormatFlag::BlockCompressed);
+                           && imageInfo.format != m_packedFormat;
     
     bool isMutable = formatFamily.FormatCount > 1;
     bool isMultiPlane = (formatProperties->aspectMask & VK_IMAGE_ASPECT_PLANE_0_BIT) != 0;
@@ -216,7 +220,25 @@ namespace dxvk {
                             | D3D11_BIND_UNORDERED_ACCESS))
       || (m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED
                             | D3D11_RESOURCE_MISC_SHARED_NTHANDLE)))) {
-      throw DxvkError("WineHua: BC emulation supports device-local sampled textures only");
+      static std::atomic<uint32_t> rejectedTextures { 0 };
+      const uint32_t sequence = rejectedTextures.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+      throw DxvkError(str::format(
+        "WineHuaBcUnsupported: sequence=", sequence,
+        " dimension=", uint32_t(m_dimension),
+        " size=", m_desc.Width, "x", m_desc.Height, "x", m_desc.Depth,
+        " mips=", m_desc.MipLevels,
+        " layers=", m_desc.ArraySize,
+        " dxgiFormat=", uint32_t(m_desc.Format),
+        " packedFormat=", uint32_t(m_packedFormat),
+        " backingFormat=", uint32_t(imageInfo.format),
+        " usage=", uint32_t(m_desc.Usage),
+        " bind=0x", std::hex, m_desc.BindFlags,
+        " cpu=0x", m_desc.CPUAccessFlags,
+        " misc=0x", m_desc.MiscFlags, std::dec,
+        " mapMode=", uint32_t(m_mapMode),
+        " samples=", m_desc.SampleDesc.Count,
+        " layout=", uint32_t(m_desc.TextureLayout)));
     }
     
     // If the image is mapped directly to host memory, we need

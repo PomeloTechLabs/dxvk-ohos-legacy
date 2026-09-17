@@ -138,13 +138,25 @@ namespace dxvk {
       depthRef.layout     = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     
+    // Keep the subpass attachment count equal to the highest actually bound
+    // color slot.  Passing all eight slots with trailing VK_ATTACHMENT_UNUSED
+    // is legal on paper, but affected Huawei drivers have crashed while
+    // compiling complex four-target PSOs in that shape.  Android's Vulkan
+    // backend uses the compact color count as well.
+    uint32_t colorAttachmentCount = 0;
+    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
+      if (m_format.color[i].format != VK_FORMAT_UNDEFINED)
+        colorAttachmentCount = i + 1;
+    }
+
     VkSubpassDescription subpass;
     subpass.flags                     = 0;
     subpass.pipelineBindPoint         = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.inputAttachmentCount      = 0;
     subpass.pInputAttachments         = nullptr;
-    subpass.colorAttachmentCount      = colorRef.size();
-    subpass.pColorAttachments         = colorRef.data();
+    subpass.colorAttachmentCount      = colorAttachmentCount;
+    subpass.pColorAttachments         = colorAttachmentCount
+      ? colorRef.data() : nullptr;
     subpass.pResolveAttachments       = nullptr;
     subpass.pDepthStencilAttachment   = &depthRef;
     subpass.preserveAttachmentCount   = 0;

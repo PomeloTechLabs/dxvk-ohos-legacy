@@ -2345,7 +2345,7 @@ namespace dxvk {
     #if defined(DXVK_NATIVE_OHOS)
     const auto packed = LookupPackedFormat(Format, DXGI_VK_FORMAT_MODE_ANY);
     const bool bcEmulated = imageFormatInfo(packed.Format)->flags.test(DxvkFormatFlag::BlockCompressed)
-      && !fmtProperties->flags.test(DxvkFormatFlag::BlockCompressed);
+      && fmtMapping.Format != packed.Format;
 
     if (bcEmulated) {
       // All decoded BC families have a different backing layout. Do not

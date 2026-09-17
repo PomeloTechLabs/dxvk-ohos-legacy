@@ -7,6 +7,7 @@
 #include "dxvk_state_cache.h"
 #include "dxvk_winehua_trace.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -146,6 +147,23 @@ namespace dxvk {
 
     // Render pass format and image layouts
     DxvkRenderPassFormat passFormat = renderPass->format();
+
+    uint32_t colorAttachmentCount = 0;
+    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
+      if (passFormat.color[i].format != VK_FORMAT_UNDEFINED)
+        colorAttachmentCount = i + 1;
+    }
+
+    const bool knownD32S8Mrt =
+      winehuaSkipKnownD32S8MrtPipeline()
+      && colorAttachmentCount >= 4
+      && passFormat.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT
+      && m_shaders.vs != nullptr
+      && m_shaders.fs != nullptr
+      && m_shaders.vs->debugName() ==
+        "VS_bdbaa3489b3ec8c417f06cedbbdff0cbbda6cab2"
+      && m_shaders.fs->debugName() ==
+        "FS_50c4199f44db8227ce517bf10c1e196229651ce5";
     
     // Set up dynamic states as needed
     std::array<VkDynamicState, 6> dynamicStates;
@@ -205,6 +223,16 @@ namespace dxvk {
       specData.set(getSpecId(i), state.sc.specConstants[i], 0u);
     
     VkSpecializationInfo specInfo = specData.getSpecInfo();
+
+    // Serialize the complete driver compiler lifetime. The state-cache
+    // workers and the CS thread may reach different pipeline objects at the
+    // same time, which is unstable on affected mobile Vulkan drivers.
+    std::lock_guard<dxvk::mutex> pipelineCompileLock(
+      m_pipeMgr->m_pipelineCompileMutex);
+    const uint64_t pipelineSequence =
+      m_pipeMgr->m_pipelineCreateSequence.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    const bool tracePipeline = winehuaPipelineTraceEnabled();
     
     winehuaFlowTrace("graphics-pipeline begin");
 
@@ -212,7 +240,8 @@ namespace dxvk {
     auto tcsm = createShaderModule(m_shaders.tcs, state, false);
     auto tesm = createShaderModule(m_shaders.tes, state, false);
     auto gsm  = createShaderModule(m_shaders.gs,  state, false);
-    auto fsm  = createShaderModule(m_shaders.fs,  state, secondaryOutput);
+    auto fsm  = createShaderModule(m_shaders.fs,  state, secondaryOutput,
+      knownD32S8Mrt);
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     if (vsm)  stages.push_back(vsm.stageInfo(&specInfo));
@@ -228,11 +257,13 @@ namespace dxvk {
       = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
+    const uint32_t fsOutMask = knownD32S8Mrt ? 0x1u : m_fsOut;
+
     for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
       auto formatInfo = imageFormatInfo(passFormat.color[i].format);
       omBlendAttachments[i] = state.omBlend[i].state();
 
-      if (!(m_fsOut & (1 << i)) || !formatInfo) {
+      if (!(fsOutMask & (1 << i)) || !formatInfo) {
         omBlendAttachments[i].colorWriteMask = 0;
       } else {
         if (omBlendAttachments[i].colorWriteMask != fullMask) {
@@ -399,6 +430,34 @@ namespace dxvk {
     dsInfo.minDepthBounds         = 0.0f;
     dsInfo.maxDepthBounds         = 1.0f;
 
+    const bool hasDepthAttachment =
+      passFormat.depth.format != VK_FORMAT_UNDEFINED;
+    if (!hasDepthAttachment) {
+      const bool requestedDepthStencil =
+        dsInfo.depthTestEnable || dsInfo.depthWriteEnable
+        || dsInfo.depthBoundsTestEnable || dsInfo.stencilTestEnable;
+      if (requestedDepthStencil) {
+        static std::atomic<uint32_t> noDepthAttachmentCount { 0 };
+        const uint32_t sequence = noDepthAttachmentCount.fetch_add(
+          1, std::memory_order_relaxed) + 1;
+        if (sequence <= 32) {
+          Logger::warn(str::format(
+            "WineHuaNoDepthAttachment: sequence=", sequence,
+            " action=disable-depth-stencil",
+            " depthTest=", uint32_t(dsInfo.depthTestEnable),
+            " depthWrite=", uint32_t(dsInfo.depthWriteEnable),
+            " depthBounds=", uint32_t(dsInfo.depthBoundsTestEnable),
+            " stencil=", uint32_t(dsInfo.stencilTestEnable),
+            " vs=", m_shaders.vs != nullptr ? m_shaders.vs->debugName() : "none",
+            " fs=", m_shaders.fs != nullptr ? m_shaders.fs->debugName() : "none"));
+        }
+      }
+      dsInfo.depthTestEnable = VK_FALSE;
+      dsInfo.depthWriteEnable = VK_FALSE;
+      dsInfo.depthBoundsTestEnable = VK_FALSE;
+      dsInfo.stencilTestEnable = VK_FALSE;
+    }
+
     const bool forceHeavenPass2DepthAlways =
       winehuaForceHeavenPass2DepthAlways()
       && dsInfo.depthTestEnable
@@ -409,7 +468,7 @@ namespace dxvk {
       && m_shaders.fs != nullptr;
 
     if (forceHeavenPass2DepthAlways) {
-      Logger::info(str::format(
+      winehuaPipelineTraceEmit(str::format(
         "WineHuaHeavenDepthAB: forcing compare ALWAYS vs=",
         m_shaders.vs->debugName(), " fs=", m_shaders.fs->debugName(),
         " colorFormat=", uint32_t(passFormat.color[0].format),
@@ -419,13 +478,52 @@ namespace dxvk {
       dsInfo.depthCompareOp = VK_COMPARE_OP_ALWAYS;
     }
     
+    /* The stencil workaround exists for one medium-quality foliage shader pair
+     * whose 4-MRT + D32S8 pipeline faults inside the Maleoon driver.  Applying
+     * it to *every* pipeline with that attachment combination also removed the
+     * stencil classification the deferred lighting reads (t11.y & 8), which
+     * blacked out all geometry while the sky stayed correct.  The other 27
+     * pipelines with the same attachments compiled fine, so the workaround is
+     * limited to the pair that actually faults. */
+    const bool avoidD32S8MrtStencil =
+      winehuaAvoidD32S8MrtStencil()
+      && colorAttachmentCount >= 4
+      && passFormat.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT
+      && dsInfo.stencilTestEnable
+      && m_shaders.vs != nullptr
+      && m_shaders.fs != nullptr
+      && m_shaders.vs->debugName() ==
+        "VS_bdbaa3489b3ec8c417f06cedbbdff0cbbda6cab2"
+      && m_shaders.fs->debugName() ==
+        "FS_50c4199f44db8227ce517bf10c1e196229651ce5";
+    if (avoidD32S8MrtStencil) {
+      winehuaPipelineTraceEmit(str::format(
+        "WineHuaD32S8MrtStencil: action=disable-stencil",
+        " colorAttachmentCount=", colorAttachmentCount,
+        " depthFormat=", uint32_t(passFormat.depth.format),
+        " vs=", m_shaders.vs != nullptr ? m_shaders.vs->debugName() : "none",
+        " fs=", m_shaders.fs != nullptr ? m_shaders.fs->debugName() : "none"));
+      dsInfo.stencilTestEnable = VK_FALSE;
+    }
+
+    if (knownD32S8Mrt) {
+      winehuaPipelineTraceEmit(str::format(
+        "WineHuaD32S8MrtKnown: action=mask-aux-outputs",
+        " colorAttachmentCount=", colorAttachmentCount,
+        " depthFormat=", uint32_t(passFormat.depth.format),
+        " vs=", m_shaders.vs->debugName(),
+        " fs=", m_shaders.fs->debugName(),
+        " originalFsOutMask=0x", std::hex, m_fsOut,
+        " effectiveFsOutMask=0x", fsOutMask));
+    }
+
     VkPipelineColorBlendStateCreateInfo cbInfo;
     cbInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cbInfo.pNext                  = nullptr;
     cbInfo.flags                  = 0;
     cbInfo.logicOpEnable          = state.om.enableLogicOp();
     cbInfo.logicOp                = state.om.logicOp();
-    cbInfo.attachmentCount        = DxvkLimits::MaxNumRenderTargets;
+    cbInfo.attachmentCount        = colorAttachmentCount;
     cbInfo.pAttachments           = omBlendAttachments.data();
     
     for (uint32_t i = 0; i < 4; i++)
@@ -471,9 +569,113 @@ namespace dxvk {
     winehuaFlowTrace(str::format(
       "graphics-pipeline vkCreate begin stages=", stages.size()));
 
+    if (tracePipeline) {
+      winehuaPipelineTraceEmit(str::format(
+        "WineHuaPipelineCreate: phase=begin sequence=", pipelineSequence,
+        " type=graphics secondary=", uint32_t(secondaryOutput),
+        " profile=", winehuaDiagnosticProfile(),
+        " stages=", stages.size(),
+        " vs=", m_shaders.vs != nullptr ? m_shaders.vs->debugName() : "none",
+        " tcs=", m_shaders.tcs != nullptr ? m_shaders.tcs->debugName() : "none",
+        " tes=", m_shaders.tes != nullptr ? m_shaders.tes->debugName() : "none",
+        " gs=", m_shaders.gs != nullptr ? m_shaders.gs->debugName() : "none",
+        " fs=", m_shaders.fs != nullptr ? m_shaders.fs->debugName() : "none",
+        " topology=", uint32_t(iaInfo.topology),
+        " patchPoints=", tsInfo.patchControlPoints,
+        " viewports=", vpInfo.viewportCount,
+        " bindings=", viInfo.vertexBindingDescriptionCount,
+        " attributes=", viInfo.vertexAttributeDescriptionCount,
+        " samples=", uint32_t(msInfo.rasterizationSamples),
+        " renderPassSamples=", uint32_t(passFormat.sampleCount),
+        " sampleMask=0x", std::hex, sampleMask,
+        " alphaToCoverage=", uint32_t(msInfo.alphaToCoverageEnable),
+        " sampleShading=", uint32_t(msInfo.sampleShadingEnable),
+        " sampleShadingFactor=", msInfo.minSampleShading,
+        " specCount=", specInfo.mapEntryCount,
+        " specDataBytes=", specInfo.dataSize,
+        " specHash=0x", std::hex, winehuaSpecializationHash(specInfo),
+        " depthFormat=", uint32_t(passFormat.depth.format),
+        " depthTest=", uint32_t(dsInfo.depthTestEnable),
+        " depthWrite=", uint32_t(dsInfo.depthWriteEnable),
+        " stencil=", uint32_t(dsInfo.stencilTestEnable),
+        " colorAttachmentCount=", colorAttachmentCount,
+        " colorFormats=", uint32_t(passFormat.color[0].format), ",",
+          uint32_t(passFormat.color[1].format), ",",
+          uint32_t(passFormat.color[2].format), ",",
+          uint32_t(passFormat.color[3].format), ",",
+          uint32_t(passFormat.color[4].format), ",",
+          uint32_t(passFormat.color[5].format), ",",
+          uint32_t(passFormat.color[6].format), ",",
+          uint32_t(passFormat.color[7].format),
+        " fsOutMask=0x", std::hex, fsOutMask,
+        " vsInMask=0x", m_vsIn,
+        " fsFlags=0x", m_shaders.fs != nullptr
+          ? uint64_t(m_shaders.fs->flags().raw()) : uint64_t(0),
+        " layout=0x", std::hex, m_layout->pipelineLayout(),
+        " renderPass=0x", renderPass->getDefaultHandle()));
+
+      auto traceShader = [&](const char* stageName,
+          const Rc<DxvkShader>& shader, const DxvkShaderModule& module) {
+        if (shader == nullptr)
+          return;
+        uint32_t resourceTypes = 0;
+        for (uint32_t i = 0; i < shader->info().resourceSlotCount && i < 16; i++)
+          resourceTypes |= (uint32_t(shader->info().resourceSlots[i].type) & 0x1fu) << (i * 2);
+        winehuaPipelineTraceEmit(str::format(
+          "WineHuaPipelineShader: sequence=", pipelineSequence,
+          " stage=", stageName,
+          " name=", shader->debugName(),
+          " spirvHash=0x", std::hex, module.winehuaCodeHash(),
+          " spirvBytes=", std::dec, module.winehuaCodeSize(),
+          " resources=", shader->info().resourceSlotCount,
+          " resourceTypes=0x", std::hex, resourceTypes,
+          " inputMask=0x", shader->info().inputMask,
+          " outputMask=0x", shader->info().outputMask,
+          " pushConstants=", std::dec, shader->info().pushConstSize));
+      };
+      traceShader("vs",  m_shaders.vs,  vsm);
+      traceShader("tcs", m_shaders.tcs, tcsm);
+      traceShader("tes", m_shaders.tes, tesm);
+      traceShader("gs",  m_shaders.gs,  gsm);
+      traceShader("fs",  m_shaders.fs,  fsm);
+
+      for (uint32_t i = 0; i < colorAttachmentCount; i++) {
+        winehuaPipelineTraceEmit(str::format(
+          "WineHuaPipelineBlend: sequence=", pipelineSequence,
+          " index=", i,
+          " enable=", uint32_t(omBlendAttachments[i].blendEnable),
+          " srcColor=", uint32_t(omBlendAttachments[i].srcColorBlendFactor),
+          " dstColor=", uint32_t(omBlendAttachments[i].dstColorBlendFactor),
+          " colorOp=", uint32_t(omBlendAttachments[i].colorBlendOp),
+          " srcAlpha=", uint32_t(omBlendAttachments[i].srcAlphaBlendFactor),
+          " dstAlpha=", uint32_t(omBlendAttachments[i].dstAlphaBlendFactor),
+          " alphaOp=", uint32_t(omBlendAttachments[i].alphaBlendOp),
+          " writeMask=0x", std::hex,
+            uint32_t(omBlendAttachments[i].colorWriteMask)));
+      }
+
+      for (uint32_t i = 0; i < viInfo.vertexAttributeDescriptionCount; i++) {
+        winehuaPipelineTraceEmit(str::format(
+          "WineHuaPipelineAttrib: sequence=", pipelineSequence,
+          " index=", i,
+          " location=", viAttribs[i].location,
+          " binding=", viAttribs[i].binding,
+          " format=", uint32_t(viAttribs[i].format),
+          " offset=", viAttribs[i].offset));
+      }
+    }
+
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
-          m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
+    const VkResult pipelineStatus = m_vkd->vkCreateGraphicsPipelines(
+      m_vkd->device(), m_pipeMgr->m_cache->handle(),
+      1, &info, nullptr, &pipeline);
+    if (tracePipeline) {
+      winehuaPipelineTraceEmit(str::format(
+        "WineHuaPipelineCreate: phase=end sequence=", pipelineSequence,
+        " type=graphics result=", int32_t(pipelineStatus),
+        " pipeline=0x", std::hex, pipeline));
+    }
+    if (pipelineStatus != VK_SUCCESS) {
       Logger::err("DxvkGraphicsPipeline: Failed to compile pipeline");
       this->logPipelineState(LogLevel::Error, state);
       return VK_NULL_HANDLE;
@@ -509,7 +711,8 @@ namespace dxvk {
   DxvkShaderModule DxvkGraphicsPipeline::createShaderModule(
     const Rc<DxvkShader>&                shader,
     const DxvkGraphicsPipelineStateInfo& state,
-          bool                           secondaryOutput) const {
+          bool                           secondaryOutput,
+          bool                           winehuaDropAuxiliaryOutputs) const {
     if (shader == nullptr)
       return DxvkShaderModule();
 
@@ -518,6 +721,11 @@ namespace dxvk {
     info.freezeBoolSpec = dxvkWineHuaFreezeBoolSpec(m_pipeMgr->m_device);
     info.boolSpecMask = &state.bsBindingMask;
     info.boolSpecCount = m_layout->bindingCount();
+    info.winehuaDropAuxiliaryOutputs = winehuaDropAuxiliaryOutputs;
+    info.winehuaSingleSampleInterpolation =
+      winehuaReplaceSingleSampleInterpolation()
+      && shaderInfo.stage == VK_SHADER_STAGE_FRAGMENT_BIT
+      && state.ms.sampleCount() == VK_SAMPLE_COUNT_1_BIT;
 
     // Fix up fragment shader outputs for dual-source blending
     if (shaderInfo.stage == VK_SHADER_STAGE_FRAGMENT_BIT) {

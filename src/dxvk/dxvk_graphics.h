@@ -265,7 +265,8 @@ namespace dxvk {
     DxvkShaderModule createShaderModule(
       const Rc<DxvkShader>&                shader,
       const DxvkGraphicsPipelineStateInfo& state,
-            bool                          secondaryOutput = false) const;
+            bool                          secondaryOutput = false,
+            bool                          winehuaDropAuxiliaryOutputs = false) const;
     
     Rc<DxvkShader> getPrevStageShader(
             VkShaderStageFlagBits          stage) const;

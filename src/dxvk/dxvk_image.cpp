@@ -2,6 +2,7 @@
 
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
+#include "dxvk_ohos_memory_stats.h"
 #include "dxvk_winehua_trace.h"
 
 namespace dxvk {
@@ -156,6 +157,8 @@ namespace dxvk {
           m_image.memory.memory(), m_image.memory.offset()) != VK_SUCCESS)
       throw DxvkError("DxvkImage::DxvkImage: Failed to bind device memory");
 
+    ohosAccumulateImage(m_image.memory.length());
+
     if (winehuaSampleTraceEnabled()
      && (createInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT)
      && (createInfo.format == VK_FORMAT_R8G8B8A8_UNORM
@@ -197,8 +200,10 @@ namespace dxvk {
   DxvkImage::~DxvkImage() {
     // This is a bit of a hack to determine whether
     // the image is implementation-handled or not
-    if (m_image.memory.memory() != VK_NULL_HANDLE)
+    if (m_image.memory.memory() != VK_NULL_HANDLE) {
+      ohosReleaseImage(m_image.memory.length());
       m_vkd->vkDestroyImage(m_vkd->device(), m_image.image, nullptr);
+    }
   }
 
 

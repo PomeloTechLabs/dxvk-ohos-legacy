@@ -120,6 +120,16 @@ namespace dxvk {
   struct DxvkShaderModuleCreateInfo {
     bool      fsDualSrcBlend  = false;
     bool      fsSecondaryOutput = false;
+    /* Maleoon workaround: compile the selected fragment shader with only its
+     * primary color output exposed to the Vulkan interface.  The render pass
+     * still owns all attachments; auxiliary stores are redirected to private
+     * variables in the SPIR-V module. */
+    bool      winehuaDropAuxiliaryOutputs = false;
+    /* Maleoon workaround: a single-sample pipeline cannot observe a difference
+     * between a per-sample interpolant read and an ordinary input read, so the
+     * former is replaced by the latter to keep the driver away from the faulty
+     * compilation path. */
+    bool      winehuaSingleSampleInterpolation = false;
     bool      freezeBoolSpec  = false;
     const DxvkBindingMask* boolSpecMask = nullptr;
     uint32_t  boolSpecCount   = 0;
@@ -305,6 +315,14 @@ namespace dxvk {
     const std::string& winehuaVariantId() const {
       return m_winehuaVariantId;
     }
+
+    uint64_t winehuaCodeHash() const {
+      return m_winehuaCodeHash;
+    }
+
+    size_t winehuaCodeSize() const {
+      return m_winehuaCodeSize;
+    }
     
     /**
      * \brief Checks whether module is valid
@@ -319,6 +337,8 @@ namespace dxvk {
     Rc<vk::DeviceFn>                m_vkd;
     VkPipelineShaderStageCreateInfo m_stage;
     std::string                     m_winehuaVariantId;
+    uint64_t                        m_winehuaCodeHash = 0;
+    size_t                          m_winehuaCodeSize = 0;
     
   };
   

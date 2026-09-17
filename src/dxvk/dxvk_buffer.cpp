@@ -2,6 +2,7 @@
 #include "dxvk_buffer.h"
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
+#include "dxvk_ohos_memory_stats.h"
 #include "dxvk_winehua_trace.h"
 
 #include <algorithm>
@@ -53,12 +54,14 @@ namespace dxvk {
 
     m_physSlice = slice;
     m_lazyAlloc = m_physSliceCount > 1;
+    ohosAccumulateBuffer(m_info.size);
   }
 
 
   DxvkBuffer::~DxvkBuffer() {
     auto vkd = m_device->vkd();
 
+    ohosReleaseBuffer(m_info.size);
     for (const auto& buffer : m_buffers)
       vkd->vkDestroyBuffer(vkd->device(), buffer.buffer, nullptr);
     vkd->vkDestroyBuffer(vkd->device(), m_buffer.buffer, nullptr);

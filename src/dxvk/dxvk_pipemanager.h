@@ -103,6 +103,11 @@ namespace dxvk {
 
     std::atomic<uint32_t>     m_numComputePipelines  = { 0 };
     std::atomic<uint32_t>     m_numGraphicsPipelines = { 0 };
+    std::atomic<uint64_t>     m_pipelineCreateSequence = { 0 };
+
+    // Some mobile Vulkan drivers are fragile when shader modules and
+    // pipelines are compiled concurrently on one device.
+    dxvk::mutex m_pipelineCompileMutex;
     
     dxvk::mutex m_mutex;
     

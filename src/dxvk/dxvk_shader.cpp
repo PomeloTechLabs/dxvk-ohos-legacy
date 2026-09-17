@@ -1,12 +1,14 @@
 #include "dxvk_shader.h"
 #include "dxvk_adapter.h"
 #include "dxvk_device.h"
+#include "dxvk_winehua_trace.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +16,47 @@
 #include "../util/util_env.h"
 
 namespace dxvk {
+
+  static uint32_t rewriteWinehuaAuxiliaryFragmentOutputs(
+      SpirvCodeBuffer& code,
+      bool             auxiliaryLocations,
+      bool             sampleMaskBuiltIn);
+
+  static uint32_t rewriteWinehuaSampleInterpolation(SpirvCodeBuffer& code);
+
+  static bool winehuaShaderDumpSelected(const std::string& debugName) {
+    const char* filter = std::getenv("DXVK_WINEHUA_DUMP_SHADER_NAMES");
+    if (!filter || !filter[0])
+      return true;
+
+    /* Comma-separated exact debug names. Keep matching deliberately strict so
+     * a diagnostic run cannot unexpectedly dump the full shader catalogue. */
+    const std::string names(filter);
+    size_t begin = 0;
+    while (begin <= names.size()) {
+      size_t end = names.find(',', begin);
+      if (end == std::string::npos)
+        end = names.size();
+      if (names.substr(begin, end - begin) == debugName)
+        return true;
+      if (end == names.size())
+        break;
+      begin = end + 1;
+    }
+    return false;
+  }
+
+  static bool winehuaShaderDumpClaim(uint64_t hash) {
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> hashes;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (hashes.find(hash) != hashes.end())
+      return false;
+    if (hashes.size() >= 512)
+      return false;
+    hashes.insert(hash);
+    return true;
+  }
 
   bool dxvkWineHuaFreezeBoolSpec(const DxvkDevice* device) {
     const std::string override = env::getEnvVar("DXVK_WINEHUA_FREEZE_BOOL_SPEC");
@@ -190,9 +233,13 @@ namespace dxvk {
 
   DxvkShaderModule::DxvkShaderModule(DxvkShaderModule&& other)
   : m_vkd(std::move(other.m_vkd)),
-    m_winehuaVariantId(std::move(other.m_winehuaVariantId)) {
+    m_winehuaVariantId(std::move(other.m_winehuaVariantId)),
+    m_winehuaCodeHash(other.m_winehuaCodeHash),
+    m_winehuaCodeSize(other.m_winehuaCodeSize) {
     this->m_stage = other.m_stage;
     other.m_stage = VkPipelineShaderStageCreateInfo();
+    other.m_winehuaCodeHash = 0;
+    other.m_winehuaCodeSize = 0;
   }
 
 
@@ -216,15 +263,33 @@ namespace dxvk {
     info.codeSize = code.size();
     info.pCode    = code.data();
 
+    uint64_t hash = 1469598103934665603ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(code.data());
+    for (size_t i = 0; i < code.size(); i++) {
+      hash ^= bytes[i];
+      hash *= 1099511628211ull;
+    }
+    m_winehuaCodeHash = hash;
+    m_winehuaCodeSize = code.size();
+
     const char* remappedDump = std::getenv("DXVK_WINEHUA_DUMP_REMAPPED_SPIRV");
     const char* dumpPath = std::getenv("DXVK_SHADER_DUMP_PATH");
-    if (remappedDump && remappedDump[0] == '1' && dumpPath && dumpPath[0]) {
-      uint64_t hash = 1469598103934665603ull;
-      const auto* bytes = reinterpret_cast<const uint8_t*>(code.data());
-      for (size_t i = 0; i < code.size(); i++) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ull;
-      }
+    /* The game tags the draws whose shaders matter for the current
+     * investigation (the deferred lighting draws). A tagged shader is dumped
+     * regardless of the general name filter and hash budget, because the
+     * catalogue cap is consumed long before the lighting draws run. */
+    // The game marks the draw it wants dumped with a file in the dump
+    // directory; DXVK already writes there, so the path is known-good.
+    bool lightDraw = false;
+    if (dumpPath && dumpPath[0]) {
+      std::ifstream lightMark(
+        str::tows(str::format(dumpPath, "/g9-light-draw").c_str()).c_str());
+      lightDraw = lightMark.good();
+    }
+    if (dumpPath && dumpPath[0] && (lightDraw
+        || (remappedDump && remappedDump[0] == '1'
+          && winehuaShaderDumpSelected(shader->debugName())
+          && winehuaShaderDumpClaim(hash)))) {
 
       m_winehuaVariantId = str::format(shader->debugName(), "-", std::hex, hash);
       std::ofstream uniqueDump(
@@ -238,6 +303,14 @@ namespace dxvk {
           ".remapped.spv").c_str()).c_str(),
         std::ios_base::binary | std::ios_base::trunc);
       code.store(conventionalDump);
+
+      if (lightDraw) {
+        std::ofstream markerDump(
+          str::tows(str::format(dumpPath, "/", shader->debugName(),
+            ".lightdraw-", std::hex, hash, ".spv").c_str()).c_str(),
+          std::ios_base::binary | std::ios_base::trunc);
+        code.store(markerDump);
+      }
     }
     
     if (m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &m_stage.module) != VK_SUCCESS)
@@ -257,7 +330,11 @@ namespace dxvk {
     this->m_vkd   = std::move(other.m_vkd);
     this->m_stage = other.m_stage;
     this->m_winehuaVariantId = std::move(other.m_winehuaVariantId);
+    this->m_winehuaCodeHash = other.m_winehuaCodeHash;
+    this->m_winehuaCodeSize = other.m_winehuaCodeSize;
     other.m_stage = VkPipelineShaderStageCreateInfo();
+    other.m_winehuaCodeHash = 0;
+    other.m_winehuaCodeSize = 0;
     return *this;
   }
 
@@ -398,6 +475,31 @@ namespace dxvk {
     if (info.freezeBoolSpec)
       freezeBoolSpecConstants(spirvCode, info.boolSpecMask, info.boolSpecCount);
 
+    const bool isFragment = m_info.stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+    const bool dropAuxiliaryOutputs = info.winehuaDropAuxiliaryOutputs && isFragment;
+    const bool dropSampleMaskOutput = isFragment && winehuaDropSampleMaskOutput();
+
+    if (dropAuxiliaryOutputs || dropSampleMaskOutput) {
+      const uint32_t rewritten = rewriteWinehuaAuxiliaryFragmentOutputs(
+        spirvCode, dropAuxiliaryOutputs, dropSampleMaskOutput);
+      if (rewritten) {
+        Logger::info(str::format(
+          "WineHuaD32S8MrtShader: action=drop-aux-outputs shader=",
+          isFragment ? "fragment" : "other",
+          " variables=", rewritten,
+          " auxiliary=", uint32_t(dropAuxiliaryOutputs),
+          " sampleMask=", uint32_t(dropSampleMaskOutput)));
+      }
+    }
+
+    if (isFragment && info.winehuaSingleSampleInterpolation) {
+      const uint32_t replaced = rewriteWinehuaSampleInterpolation(spirvCode);
+      if (replaced) {
+        Logger::info(str::format(
+          "WineHuaSampleInterpolation: action=replace-at-sample count=", replaced));
+      }
+    }
+
     /* Dump the final module consumed by vkCreate*Pipelines.  The bool
      * binding specialization workaround above can rewrite OpSpecConstantTrue
      * to OpConstantTrue and remove its SpecId decoration.  Dumping before
@@ -409,6 +511,353 @@ namespace dxvk {
   
   void DxvkShader::dump(std::ostream& outputStream) const {
     m_code.decompress().store(outputStream);
+  }
+
+
+  /*
+   * Rewrites selected fragment outputs into private variables.  Affected
+   * Maleoon drivers have been observed to fault while compiling one very
+   * specific D32S8/4-MRT pipeline even when the auxiliary color write masks
+   * are zero.  Merely removing the OpEntryPoint interface IDs is not enough:
+   * SPIR-V still contains Output variables and stores to them, so the driver
+   * lowers the same interface.  Converting the auxiliary variables (locations
+   * 1..3) and any access-chain pointers derived from them to Private removes
+   * them from the fragment interface while preserving the shader's internal
+   * stores.  The primary location 0 output is untouched.
+   *
+   * The same transformation optionally covers the fragment SampleMask
+   * (SV_Coverage) output and is then used as an isolation switch: the crashing
+   * foliage shader writes coverage from inside a loop, which its low-quality
+   * counterpart that compiles fine does not do.  The switch only removes the
+   * output from this module; it never changes the rest of the pipeline.
+   */
+  static uint32_t rewriteWinehuaAuxiliaryFragmentOutputs(
+      SpirvCodeBuffer& code,
+      bool             auxiliaryLocations,
+      bool             sampleMaskBuiltIn) {
+    const uint32_t* source = code.data();
+    const uint32_t wordCount = code.dwords();
+    if (!source || wordCount < 5 || source[0] != spv::MagicNumber)
+      return 0;
+
+    struct Instruction {
+      uint32_t offset;
+      uint16_t words;
+      spv::Op op;
+    };
+
+    std::vector<Instruction> instructions;
+    instructions.reserve(wordCount / 4);
+    for (uint32_t offset = 5; offset < wordCount; ) {
+      const uint32_t token = source[offset];
+      const uint16_t words = uint16_t(token >> spv::WordCountShift);
+      if (!words || offset + words > wordCount)
+        return 0;
+      instructions.push_back({ offset, words,
+        static_cast<spv::Op>(token & spv::OpCodeMask) });
+      offset += words;
+    }
+
+    std::unordered_set<uint32_t> interfaceOutputs;
+    for (const Instruction& instruction : instructions) {
+      if (instruction.op != spv::OpDecorate || instruction.words < 4)
+        continue;
+      const uint32_t offset = instruction.offset;
+      if (auxiliaryLocations &&
+          source[offset + 2] == spv::DecorationLocation &&
+          source[offset + 3] >= 1 && source[offset + 3] <= 3) {
+        interfaceOutputs.insert(source[offset + 1]);
+      } else if (sampleMaskBuiltIn &&
+          source[offset + 2] == spv::DecorationBuiltIn &&
+          source[offset + 3] == spv::BuiltInSampleMask) {
+        interfaceOutputs.insert(source[offset + 1]);
+      }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> targetVariableTypes;
+    std::unordered_set<uint32_t> targetVariables;
+    for (const Instruction& instruction : instructions) {
+      if (instruction.op != spv::OpVariable || instruction.words < 4)
+        continue;
+      const uint32_t offset = instruction.offset;
+      const uint32_t variableId = source[offset + 2];
+      if (source[offset + 3] == spv::StorageClassOutput &&
+          interfaceOutputs.find(variableId) != interfaceOutputs.end()) {
+        targetVariables.insert(variableId);
+        targetVariableTypes[variableId] = source[offset + 1];
+      }
+    }
+
+    if (targetVariables.empty())
+      return 0;
+
+    std::unordered_map<uint32_t, uint32_t> pointerPointeeTypes;
+    std::unordered_map<uint32_t, uint32_t> pointerStorageClasses;
+    for (const Instruction& instruction : instructions) {
+      if (instruction.op != spv::OpTypePointer || instruction.words < 4)
+        continue;
+      const uint32_t offset = instruction.offset;
+      pointerStorageClasses[source[offset + 1]] = source[offset + 2];
+      pointerPointeeTypes[source[offset + 1]] = source[offset + 3];
+    }
+
+    /* Track pointers derived from the selected variables.  Direct stores do
+     * not need a type rewrite, but an OpAccessChain result explicitly names a
+     * pointer type and must move from Output to Private as well. */
+    std::unordered_set<uint32_t> derivedIds = targetVariables;
+    std::unordered_set<uint32_t> derivedPointerTypes;
+    for (const auto& entry : targetVariableTypes)
+      derivedPointerTypes.insert(entry.second);
+
+    bool discovered = true;
+    while (discovered) {
+      discovered = false;
+      for (const Instruction& instruction : instructions) {
+        const uint32_t offset = instruction.offset;
+        uint32_t baseId = 0;
+        uint32_t resultId = 0;
+        if (instruction.op == spv::OpAccessChain ||
+            instruction.op == spv::OpInBoundsAccessChain ||
+            instruction.op == spv::OpPtrAccessChain) {
+          if (instruction.words < 4)
+            continue;
+          resultId = source[offset + 2];
+          baseId = source[offset + 3];
+        } else if (instruction.op == spv::OpCopyObject ||
+                   instruction.op == spv::OpBitcast) {
+          if (instruction.words < 4)
+            continue;
+          resultId = source[offset + 2];
+          baseId = source[offset + 3];
+        } else {
+          continue;
+        }
+
+        if (derivedIds.find(baseId) == derivedIds.end())
+          continue;
+        if (derivedIds.insert(resultId).second)
+          discovered = true;
+        derivedPointerTypes.insert(source[offset + 1]);
+      }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> privatePointerTypes;
+    uint32_t nextId = source[3];
+    for (uint32_t pointerType : derivedPointerTypes) {
+      const auto storage = pointerStorageClasses.find(pointerType);
+      const auto pointee = pointerPointeeTypes.find(pointerType);
+      if (storage == pointerStorageClasses.end() ||
+          pointee == pointerPointeeTypes.end() ||
+          storage->second != spv::StorageClassOutput)
+        continue;
+      privatePointerTypes[pointerType] = nextId++;
+    }
+
+    if (privatePointerTypes.empty())
+      return 0;
+
+    uint32_t firstVariableOffset = wordCount;
+    for (const Instruction& instruction : instructions) {
+      if (instruction.op == spv::OpVariable) {
+        firstVariableOffset = instruction.offset;
+        break;
+      }
+    }
+    if (firstVariableOffset == wordCount)
+      return 0;
+
+    std::vector<uint32_t> rewritten;
+    rewritten.reserve(wordCount + privatePointerTypes.size() * 4);
+    rewritten.insert(rewritten.end(), source, source + 5);
+    rewritten[3] = nextId;
+
+    auto isInterfaceDecoration = [](uint32_t decoration) {
+      switch (decoration) {
+        case spv::DecorationLocation:
+        case spv::DecorationIndex:
+        case spv::DecorationComponent:
+        case spv::DecorationBuiltIn:
+        case spv::DecorationFlat:
+        case spv::DecorationNoPerspective:
+        case spv::DecorationCentroid:
+        case spv::DecorationSample:
+        case spv::DecorationPatch:
+        case spv::DecorationInvariant:
+        case spv::DecorationStream:
+        case spv::DecorationXfbBuffer:
+        case spv::DecorationXfbStride:
+          return true;
+        default:
+          return false;
+      }
+    };
+
+    bool pointerTypesInserted = false;
+    uint32_t rewrittenVariables = 0;
+    for (const Instruction& instruction : instructions) {
+      if (!pointerTypesInserted && instruction.offset == firstVariableOffset) {
+        for (const auto& entry : privatePointerTypes) {
+          const auto pointee = pointerPointeeTypes.find(entry.first);
+          if (pointee == pointerPointeeTypes.end())
+            continue;
+          rewritten.push_back((uint32_t(4) << spv::WordCountShift) |
+            uint32_t(spv::OpTypePointer));
+          rewritten.push_back(entry.second);
+          rewritten.push_back(spv::StorageClassPrivate);
+          rewritten.push_back(pointee->second);
+        }
+        pointerTypesInserted = true;
+      }
+
+      const uint32_t offset = instruction.offset;
+      if (instruction.op == spv::OpDecorate && instruction.words >= 3 &&
+          targetVariables.find(source[offset + 1]) != targetVariables.end() &&
+          isInterfaceDecoration(source[offset + 2])) {
+        continue;
+      }
+
+      if (instruction.op == spv::OpEntryPoint && instruction.words >= 4) {
+        std::vector<uint32_t> entryPoint(source + offset,
+          source + offset + instruction.words);
+        uint32_t nameEnd = offset + 3;
+        while (nameEnd < offset + instruction.words) {
+          const uint32_t word = source[nameEnd++];
+          if ((word & 0xffU) == 0 || (word & 0xff00U) == 0 ||
+              (word & 0xff0000U) == 0 || (word & 0xff000000U) == 0)
+            break;
+        }
+        const uint32_t interfaceStart = nameEnd;
+        if (interfaceStart <= offset + instruction.words) {
+          entryPoint.resize(3 + (interfaceStart - (offset + 3)));
+          for (uint32_t cursor = interfaceStart;
+               cursor < offset + instruction.words; ++cursor) {
+            if (targetVariables.find(source[cursor]) == targetVariables.end())
+              entryPoint.push_back(source[cursor]);
+          }
+          entryPoint[0] = (uint32_t(entryPoint.size()) << spv::WordCountShift) |
+            uint32_t(spv::OpEntryPoint);
+          rewritten.insert(rewritten.end(), entryPoint.begin(), entryPoint.end());
+          continue;
+        }
+      }
+
+      std::vector<uint32_t> current(source + offset,
+        source + offset + instruction.words);
+      if (instruction.op == spv::OpVariable && instruction.words >= 4) {
+        const uint32_t variableId = source[offset + 2];
+        const auto target = targetVariableTypes.find(variableId);
+        if (target != targetVariableTypes.end()) {
+          const auto privateType = privatePointerTypes.find(target->second);
+          if (privateType != privatePointerTypes.end()) {
+            current[1] = privateType->second;
+            current[3] = spv::StorageClassPrivate;
+            ++rewrittenVariables;
+          }
+        }
+      }
+
+      if ((instruction.op == spv::OpAccessChain ||
+           instruction.op == spv::OpInBoundsAccessChain ||
+           instruction.op == spv::OpPtrAccessChain ||
+           instruction.op == spv::OpCopyObject ||
+           instruction.op == spv::OpBitcast) && instruction.words >= 3) {
+        const uint32_t resultId = source[offset + 2];
+        if (derivedIds.find(resultId) != derivedIds.end()) {
+          const auto privateType = privatePointerTypes.find(source[offset + 1]);
+          if (privateType != privatePointerTypes.end())
+            current[1] = privateType->second;
+        }
+      }
+
+      rewritten.insert(rewritten.end(), current.begin(), current.end());
+    }
+
+    if (!pointerTypesInserted || rewrittenVariables == 0)
+      return 0;
+
+    code = SpirvCodeBuffer(rewritten.size(), rewritten.data());
+    return rewrittenVariables;
+  }
+
+
+  /* Replaces per-sample interpolant reads with ordinary input reads.  See the
+   * rationale on DxvkShaderModuleCreateInfo::winehuaSingleSampleInterpolation:
+   * with one rasterization sample both forms evaluate the same interpolant, so
+   * the replacement is semantics-preserving, while the affected Maleoon driver
+   * faults on the original instruction inside the foliage shader's loop. */
+  static uint32_t rewriteWinehuaSampleInterpolation(SpirvCodeBuffer& code) {
+    constexpr uint32_t kGlslInterpolateAtSample = 77;
+
+    const uint32_t* source = code.data();
+    const uint32_t wordCount = code.dwords();
+    if (!source || wordCount < 5 || source[0] != spv::MagicNumber)
+      return 0;
+
+    struct Instruction {
+      uint32_t offset;
+      uint16_t words;
+      spv::Op op;
+    };
+
+    std::vector<Instruction> instructions;
+    instructions.reserve(wordCount / 4);
+    for (uint32_t offset = 5; offset < wordCount; ) {
+      const uint32_t token = source[offset];
+      const uint16_t words = uint16_t(token >> spv::WordCountShift);
+      if (!words || offset + words > wordCount)
+        return 0;
+      instructions.push_back({ offset, words,
+        static_cast<spv::Op>(token & spv::OpCodeMask) });
+      offset += words;
+    }
+
+    /* Resolve variable ids to the pointee type of their pointer type so every
+     * replacement can be proven type-correct before it is emitted. */
+    std::unordered_map<uint32_t, uint32_t> pointerPointees;
+    for (const Instruction& instruction : instructions) {
+      if (instruction.op == spv::OpTypePointer && instruction.words >= 4)
+        pointerPointees[source[instruction.offset + 1]] = source[instruction.offset + 3];
+    }
+
+    std::unordered_map<uint32_t, uint32_t> variablePointees;
+    for (const Instruction& instruction : instructions) {
+      if (instruction.op != spv::OpVariable || instruction.words < 4)
+        continue;
+      const auto entry = pointerPointees.find(source[instruction.offset + 1]);
+      if (entry != pointerPointees.end())
+        variablePointees[source[instruction.offset + 2]] = entry->second;
+    }
+
+    std::vector<uint32_t> rewritten;
+    rewritten.reserve(wordCount);
+    rewritten.insert(rewritten.end(), source, source + 5);
+
+    uint32_t replaced = 0;
+    for (const Instruction& instruction : instructions) {
+      const uint32_t offset = instruction.offset;
+      if (instruction.op == spv::OpExtInst && instruction.words == 7
+          && source[offset + 4] == kGlslInterpolateAtSample) {
+        const uint32_t resultType = source[offset + 1];
+        const auto pointee = variablePointees.find(source[offset + 5]);
+        if (pointee != variablePointees.end() && pointee->second == resultType) {
+          rewritten.push_back((uint32_t(4) << spv::WordCountShift) |
+            uint32_t(spv::OpLoad));
+          rewritten.push_back(resultType);
+          rewritten.push_back(source[offset + 2]);
+          rewritten.push_back(source[offset + 5]);
+          ++replaced;
+          continue;
+        }
+      }
+      rewritten.insert(rewritten.end(), source + offset,
+        source + offset + instruction.words);
+    }
+
+    if (!replaced)
+      return 0;
+
+    code = SpirvCodeBuffer(rewritten.size(), rewritten.data());
+    return replaced;
   }
 
 

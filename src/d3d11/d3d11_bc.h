@@ -13,6 +13,7 @@ namespace dxvk {
    */
   bool DecodeD3D11BcImage(
           VkFormat                 format,
+          VkFormat                 targetFormat,
           VkExtent3D               extent,
     const void*                    source,
           VkDeviceSize             sourceRowPitch,

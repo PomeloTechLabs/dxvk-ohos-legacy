@@ -1,5 +1,6 @@
 #include "dxbc_compiler.h"
 #include "dxbc_interface.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
 
@@ -7485,7 +7486,8 @@ namespace dxvk {
     // coverage for partially transparent texels. Keeping non-zero alpha is
     // important for this sample's fine leaf and grass edges; a fixed 0.5
     // alpha-test removes most of those valid texels.
-    if (m_oRegs[0].id != 0
+    if (!winehuaDisableA2cSingleSample()
+     && m_oRegs[0].id != 0
      && m_oRegs[0].type.ctype == DxbcScalarType::Float32
      && m_oRegs[0].type.ccount >= 4) {
       const uint32_t enabled = emitNewSpecConstant(

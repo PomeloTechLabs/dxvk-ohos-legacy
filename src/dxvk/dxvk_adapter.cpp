@@ -2,6 +2,9 @@
 #include <unordered_set>
 
 #include "dxvk_adapter.h"
+
+#include <cstdlib>
+#include <string>
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
 
@@ -753,6 +756,28 @@ namespace dxvk {
     }
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);
+
+    /* Feature rollback for the cross-device comparison.
+     *
+     * Two devices of the same family can advertise different sets of optional
+     * features, and DXVK then takes different code paths for the same game.  A
+     * rendering difference that only appears on the newer device has to be split
+     * into the port asking for something different and the driver doing something
+     * different, and the way to do that on one machine is to report the older
+     * device feature set here.  WINEHUA_DXVK_DISABLE_FEATURES is a comma
+     * separated list of robustness2, transform-feedback and vertex-divisor. */
+    {
+      const char* disableList = std::getenv("WINEHUA_DXVK_DISABLE_FEATURES");
+      if (disableList && disableList[0]) {
+        const std::string list(disableList);
+        if (list.find("robustness2") != std::string::npos)
+          m_deviceFeatures.extRobustness2.nullDescriptor = VK_FALSE;
+        if (list.find("transform-feedback") != std::string::npos)
+          m_deviceFeatures.extTransformFeedback.transformFeedback = VK_FALSE;
+        if (list.find("vertex-divisor") != std::string::npos)
+          m_deviceFeatures.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor = VK_FALSE;
+      }
+    }
   }
 
 

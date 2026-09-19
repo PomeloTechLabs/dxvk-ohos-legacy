@@ -28,8 +28,18 @@ namespace dxvk {
      && (devInfo.coreSubgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
     useDemoteToHelperInvocation
       = (devFeatures.extShaderDemoteToHelperInvocation.shaderDemoteToHelperInvocation);
-    supportsMaintenance4
-      = (devFeatures.khrMaintenance4.maintenance4);
+    /* Stage-interface component counts.
+     *
+     * Huawei's Android reference keeps the full four registers on a stage
+     * interface unless the device advertises VK_KHR_maintenance4, which is what
+     * relaxes the matching rules.  That gate is the wrong key for this driver
+     * family: the device that advertises it (Vulkan 1.3) is also the device that
+     * renders a particle sprite as a full-screen glow, while the device without
+     * it renders the same effect correctly.  The full-register shape is legal on
+     * both, so it is what the port emits, and the switch puts the relaxed shape
+     * back for an A/B run. */
+    supportsMaintenance4 =
+      env::getEnvVar("WINEHUA_DXVK_STAGE_INTERFACE") == "relaxed";
     useSubgroupOpsForEarlyDiscard
       = (devInfo.coreSubgroup.subgroupSize >= 4)
      && (devInfo.coreSubgroup.supportedStages     & VK_SHADER_STAGE_FRAGMENT_BIT)

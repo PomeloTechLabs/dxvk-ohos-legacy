@@ -1,10 +1,26 @@
 #include "dxgi_format.h"
 
 #include <array>
+#include <fstream>
 
 #include "../util/util_env.h"
+#include "../dxvk/dxvk_winehua_trace.h"
 
 namespace dxvk {
+
+  /* The DXVK log lives in a sandboxed directory the host cannot read back, so
+   * the BC backing report is mirrored next to the shader dumps, which the
+   * launcher points at a readable location. */
+  static void winehuaBcFallbackLog(const std::string& text) {
+    Logger::info(text);
+    const char* dumpPath = std::getenv("DXVK_SHADER_DUMP_PATH");
+    if (!dumpPath || !dumpPath[0])
+      return;
+    std::ofstream record(
+      str::tows(str::format(dumpPath, "/g9-bc-fallback.log").c_str()).c_str(),
+      std::ios_base::app);
+    record << text << std::endl;
+  }
   
   const std::array<DXGI_VK_FORMAT_MAPPING, 133> g_dxgiFormats = {{
     // DXGI_FORMAT_UNKNOWN
@@ -908,26 +924,39 @@ namespace dxvk {
         RemapColorFormat(format, target, identity);
       };
 
-      /* Backing format for the unsupported BC colour textures.  "rgba8" keeps
-       * the decoded pixels losslessly (default); "packed16" halves the
-       * footprint of linear colour textures by packing them into a 16-bit
-       * layout, which trades gradient banding for memory.  The switch is
-       * process-local and only affects upload-time decoding. */
+      /* Backing format for the unsupported BC colour textures.
+       *
+       * The device has no block-compression support, so the decoded pixels are
+       * stored in a format it can sample.  Without an explicit request the port
+       * picks the smallest backing the device can sample: ETC2 when supported,
+       * else packed 16-bit colour, else RGBA8.
+       *
+       * The uncompressed decode is not the default because it is not affordable
+       * here: measured on the reference device it grows the graphics footprint
+       * from 1.9 GiB to 5.5-6.0 GiB, which is the range where the system starts
+       * reclaiming the process, and it also costs frame time (P95 39 ms to
+       * 44 ms).  "rgba8" selects it explicitly, which is what a device with
+       * spare GPU memory would choose.
+       *
+       * The switch is process-local and only affects upload-time decoding. */
       const std::string backingMode = env::getEnvVar("WINEHUA_DXVK_BC_BACKING");
+      const bool automaticBacking =
+        backingMode.empty() || backingMode == "default";
       /* Bisection helpers for the ETC2 path: colour textures and the two
        * single/two-channel (normal, height, AO) textures can be enabled
        * separately to isolate visual regressions. */
-      const bool wantEtc2Color = backingMode == "etc2"
+      const bool wantEtc2Color = automaticBacking || backingMode == "etc2"
         || backingMode == "etc2color" || backingMode == "etc2eac"
         || backingMode == "etc2nosrgb";
       /* "etc2nosrgb" applies ETC2 only to linear colour textures; sRGB
        * textures keep their 8-bit layout, which isolates the sRGB block
        * formats from the rest of the transcode. */
-      const bool allowEtc2Srgb = backingMode != "etc2nosrgb";
-      const bool wantEtc2Eac = backingMode == "etc2" || backingMode == "etc2eac";
+      const bool allowEtc2Srgb = automaticBacking || backingMode != "etc2nosrgb";
+      const bool wantEtc2Eac = automaticBacking
+        || backingMode == "etc2" || backingMode == "etc2eac";
       const VkFormatProperties packedProperties =
         adapter->formatProperties(VK_FORMAT_B4G4R4A4_UNORM_PACK16);
-      const bool packed16Allowed = backingMode == "packed16"
+      const bool packed16Allowed = (automaticBacking || backingMode == "packed16")
         && (packedProperties.optimalTilingFeatures
               & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
 
@@ -981,6 +1010,65 @@ namespace dxvk {
       remap(DXGI_FORMAT_BC7_TYPELESS,   colorBacking);
       remap(DXGI_FORMAT_BC7_UNORM,      colorBacking);
       remap(DXGI_FORMAT_BC7_UNORM_SRGB, colorBackingSrgb);
+
+      /* Report the resolved BC backing mapping together with the device
+       * capabilities it came from.  The port has no native BC support here, so
+       * every BC format is served by a decoded native format; stating the
+       * decision and the probed features from the device keeps later
+       * investigations from having to infer what was chosen.  Nothing here
+       * changes the mapping itself, and it follows the port's telemetry switch
+       * because it runs on every adapter initialisation. */
+      if (winehuaTelemetryEnabled()) {
+        const auto featureString = [adapter](VkFormat format) {
+          if (format == VK_FORMAT_UNDEFINED)
+            return std::string("undefined");
+          const VkFormatProperties properties = adapter->formatProperties(format);
+          const VkFormatFeatureFlags flags = properties.optimalTilingFeatures;
+          std::string result = (flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+            ? "sampled" : "NOSAMPLE";
+          if (flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+            result += "+linear";
+          if (flags & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+            result += "+transferDst";
+          return result;
+        };
+        const auto featureValue = [adapter](VkFormat format) {
+          return format != VK_FORMAT_UNDEFINED
+            && (adapter->formatProperties(format).optimalTilingFeatures
+                & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+        };
+        winehuaBcFallbackLog(str::format("[BC-Fallback] nativeBC=",
+          lacksBcSampledImageSupport ? 0 : 1,
+          " ETC2=", featureValue(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK) ? 1 : 0,
+          " EAC=", featureValue(VK_FORMAT_EAC_R11_UNORM_BLOCK) ? 1 : 0,
+          " ASTC_LDR=", featureValue(VK_FORMAT_ASTC_4x4_UNORM_BLOCK) ? 1 : 0,
+          " packed16=", packed16Allowed ? 1 : 0));
+        winehuaBcFallbackLog(str::format("[BC-Fallback] probe ETC2_RGB=",
+          featureString(VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK).c_str(),
+          " ETC2_RGB8A1=", featureString(VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK).c_str(),
+          " ETC2_RGBA=", featureString(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK).c_str()));
+        winehuaBcFallbackLog(str::format("[BC-Fallback] probe EAC_R11=",
+          featureString(VK_FORMAT_EAC_R11_UNORM_BLOCK).c_str(),
+          " EAC_R11_SNORM=", featureString(VK_FORMAT_EAC_R11_SNORM_BLOCK).c_str(),
+          " EAC_R11G11=", featureString(VK_FORMAT_EAC_R11G11_UNORM_BLOCK).c_str(),
+          " EAC_R11G11_SNORM=", featureString(VK_FORMAT_EAC_R11G11_SNORM_BLOCK).c_str()));
+        winehuaBcFallbackLog(str::format("[BC-Fallback] probe ASTC_4x4=",
+          featureString(VK_FORMAT_ASTC_4x4_UNORM_BLOCK).c_str(),
+          " ASTC_4x4_SRGB=", featureString(VK_FORMAT_ASTC_4x4_SRGB_BLOCK).c_str(),
+          " RGBA16F=", featureString(VK_FORMAT_R16G16B16A16_SFLOAT).c_str()));
+        winehuaBcFallbackLog(str::format("[BC-Fallback] map BC1->",
+          uint32_t(colorBacking),
+          " BC2->", uint32_t(colorBacking),
+          " BC3->", uint32_t(colorBacking),
+          " BC4->", uint32_t(eacAllowed ? VK_FORMAT_EAC_R11_UNORM_BLOCK : VK_FORMAT_R8_UNORM),
+          " BC5->", uint32_t(eacAllowed ? VK_FORMAT_EAC_R11G11_UNORM_BLOCK : VK_FORMAT_R8G8_UNORM),
+          " BC6H->", uint32_t(VK_FORMAT_R16G16B16A16_SFLOAT),
+          " BC7->", uint32_t(colorBacking),
+          " srgbBC1/2/3/7->", uint32_t(colorBackingSrgb),
+          " bc4Snorm->", uint32_t(VK_FORMAT_R8_SNORM),
+          " bc5Snorm->", uint32_t(VK_FORMAT_R8G8_SNORM),
+          " bc4SnormEac=", featureValue(VK_FORMAT_EAC_R11_SNORM_BLOCK) ? 1 : 0));
+      }
 
       const DXGI_VK_FORMAT_FAMILY rgba8Family = {
         VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB };

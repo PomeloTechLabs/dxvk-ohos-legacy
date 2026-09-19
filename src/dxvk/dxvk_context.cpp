@@ -14,6 +14,7 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "dxvk_winehua_trace.h"
+#include "dxvk_winehua_submit_stats.h"
 #include "../dxbc/dxbc_util.h"
 #include "../util/util_string.h"
 
@@ -108,6 +109,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushCommandList() {
+    winehuaRecordSubmit(WinehuaSubmitReason::FlushCommandList);
     m_device->submitCommandList(
       this->endRecording(),
       VK_NULL_HANDLE,

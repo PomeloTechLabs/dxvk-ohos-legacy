@@ -6,6 +6,7 @@
 #include "../dxgi/dxgi_ohos_swapchain.h"
 #include "../wsi/ohos_present_policy.h"
 #include "../dxvk/dxvk_ohos_memory_stats.h"
+#include "../dxvk/dxvk_winehua_submit_stats.h"
 
 #include <array>
 #include <atomic>
@@ -325,8 +326,10 @@ namespace dxvk {
 
       /* Bounded GPU-memory attribution: every few seconds report what DXVK's
        * own allocator holds versus what the driver reports for the heap, so a
-       * runaway footprint can be attributed without an external profiler. */
-      {
+       * runaway footprint can be attributed without an external profiler.  It
+       * queries the driver's heap state, so it follows the port's telemetry
+       * switch. */
+      if (winehuaTelemetryEnabled()) {
         static std::chrono::steady_clock::time_point sLastReport;
         const auto now = std::chrono::steady_clock::now();
         if (sLastReport == std::chrono::steady_clock::time_point()
@@ -542,6 +545,18 @@ namespace dxvk {
       info = m_presenter->info();
       g9PresentMode = static_cast<uint32_t>(info.presentMode);
       g9ImageCount = info.imageCount;
+      /* Report the swapchain state that actually limits how far the CPU may run
+       * ahead: the configured frame latency is only a request, and the image
+       * count can cap it. */
+      {
+        WinehuaPresentState& state = winehuaPresentState();
+        state.imageCount.store(info.imageCount, std::memory_order_relaxed);
+        state.presentMode.store(static_cast<uint32_t>(info.presentMode),
+          std::memory_order_relaxed);
+        state.configuredLatency.store(m_frameLatencyCap, std::memory_order_relaxed);
+        state.actualLatency.store(GetActualFrameLatency(), std::memory_order_relaxed);
+      }
+      winehuaPresentTick();
       // Count only frames actually submitted; timeouts must not leave holes
       // in the frame-latency fence's sequence.
       ++m_frameId;

@@ -1,6 +1,7 @@
 #include "d3d11_device.h"
 #include "d3d11_query.h"
 #include "../dxvk/dxvk_winehua_trace.h"
+#include "../dxvk/dxvk_winehua_submit_stats.h"
 
 namespace dxvk {
   
@@ -193,6 +194,7 @@ namespace dxvk {
   
   
   void D3D11Query::Begin(DxvkContext* ctx) {
+    winehuaQueryCounters().begin.fetch_add(1, std::memory_order_relaxed);
     winehuaFlowTrace(str::format(
       "d3d11-query-cmd-begin type=", uint32_t(m_desc.Query),
       " query=", this));
@@ -217,6 +219,7 @@ namespace dxvk {
   
   
   void D3D11Query::End(DxvkContext* ctx) {
+    winehuaQueryCounters().end.fetch_add(1, std::memory_order_relaxed);
     winehuaFlowTrace(str::format(
       "d3d11-query-cmd-end begin type=", uint32_t(m_desc.Query),
       " query=", this));
@@ -293,8 +296,12 @@ namespace dxvk {
     if (m_state != D3D11_VK_QUERY_ENDED)
       return DXGI_ERROR_INVALID_CALL;
 
+    winehuaQueryCounters().getData.fetch_add(1, std::memory_order_relaxed);
     if (m_resetCtr != 0u)
+    {
+      winehuaQueryCounters().getDataPending.fetch_add(1, std::memory_order_relaxed);
       return S_FALSE;
+    }
 
     if (m_desc.Query == D3D11_QUERY_EVENT) {
       bool signaled = false;

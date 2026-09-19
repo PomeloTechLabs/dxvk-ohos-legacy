@@ -327,6 +327,15 @@ namespace dxvk {
       result.slicePitch = result.rowPitch * blocksY;
       result.data.assign(size_t(result.slicePitch) * extent.depth, 0);
 
+      /* ETC2 mode selection: the heuristic path is much faster but picks modes
+       * greedily, which is visible as banding on smooth skin gradients.  The
+       * full search costs more CPU on the first encode of a subresource and the
+       * result is cached from then on, so quality is preferred by default;
+       * GTAV_OHOS_ETC2_FAST=1 restores the fast path. */
+      const bool useFastEtc2 = [] {
+        const char* value = std::getenv("GTAV_OHOS_ETC2_FAST");
+        return value && value[0] == '1' && value[1] == '\0';
+      }();
       for (uint32_t z = 0; z < extent.depth; z++) {
         const auto* src = reinterpret_cast<const uint32_t*>(
           decoded.data() + z * decodedSlicePitch);
@@ -336,10 +345,10 @@ namespace dxvk {
 
         switch (etc2Target) {
           case Etc2Target::Rgb:
-            CompressEtc2Rgb(src, dst, blocks, paddedWidth, true);
+            CompressEtc2Rgb(src, dst, blocks, paddedWidth, useFastEtc2);
             break;
           case Etc2Target::Rgba:
-            CompressEtc2Rgba(src, dst, blocks, paddedWidth, true);
+            CompressEtc2Rgba(src, dst, blocks, paddedWidth, useFastEtc2);
             break;
           case Etc2Target::EacR:
             CompressEacR(src, dst, blocks, paddedWidth);

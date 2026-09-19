@@ -6,10 +6,12 @@
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
 #include "dxvk_winehua_trace.h"
+#include "dxvk_winehua_submit_stats.h"
 
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 namespace dxvk {
 
@@ -517,6 +519,38 @@ namespace dxvk {
         " effectiveFsOutMask=0x", fsOutMask));
     }
 
+    /* Record the native state of the medium-quality foliage pipeline for every
+     * workaround combination, so the stencil / MRT / output-mask matrix can be
+     * compared field by field from one build instead of being inferred. */
+    if (m_shaders.fs != nullptr
+        && m_shaders.fs->debugName()
+          == "FS_50c4199f44db8227ce517bf10c1e196229651ce5") {
+      const char* dumpPath = std::getenv("DXVK_SHADER_DUMP_PATH");
+      if (winehuaShaderDumpEnabled() && dumpPath && dumpPath[0]) {
+        std::ofstream record(
+          str::tows(str::format(dumpPath, "/g9-tree-shader.log").c_str()).c_str(),
+          std::ios_base::app);
+        record << "TREE_PIPELINE_STATE vs="
+               << (m_shaders.vs != nullptr ? m_shaders.vs->debugName() : "none")
+               << " fs=" << m_shaders.fs->debugName()
+               << " samples=" << uint32_t(msInfo.rasterizationSamples)
+               << " sampleShading=" << uint32_t(msInfo.sampleShadingEnable)
+               << " colorAttachmentCount=" << colorAttachmentCount
+               << " fsOutMask=0x" << std::hex << fsOutMask << std::dec
+               << " depthTest=" << uint32_t(dsInfo.depthTestEnable)
+               << " depthWrite=" << uint32_t(dsInfo.depthWriteEnable)
+               << " stencilTest=" << uint32_t(dsInfo.stencilTestEnable)
+               << " front=(compare=" << uint32_t(dsInfo.front.compareOp)
+               << ",fail=" << uint32_t(dsInfo.front.failOp)
+               << ",depthFail=" << uint32_t(dsInfo.front.depthFailOp)
+               << ",pass=" << uint32_t(dsInfo.front.passOp)
+               << ",compareMask=0x" << std::hex << dsInfo.front.compareMask
+               << ",writeMask=0x" << dsInfo.front.writeMask
+               << ",ref=0x" << dsInfo.front.reference << std::dec << ")"
+               << std::endl;
+      }
+    }
+
     VkPipelineColorBlendStateCreateInfo cbInfo;
     cbInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cbInfo.pNext                  = nullptr;
@@ -666,9 +700,26 @@ namespace dxvk {
     }
 
     VkPipeline pipeline = VK_NULL_HANDLE;
+    const uint64_t winehuaCompileBeginUs = [&] {
+      struct timespec ts = {};
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
+    }();
     const VkResult pipelineStatus = m_vkd->vkCreateGraphicsPipelines(
       m_vkd->device(), m_pipeMgr->m_cache->handle(),
       1, &info, nullptr, &pipeline);
+    {
+      struct timespec ts = {};
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      const uint64_t endUs = uint64_t(ts.tv_sec) * 1000000ull
+        + uint64_t(ts.tv_nsec) / 1000ull;
+      winehuaRecordPipelineCompile(endUs - winehuaCompileBeginUs);
+      winehuaRecordPipelineOrigin(
+        winehuaStateCacheWorkerFlag()
+          ? WinehuaPipelineOrigin::StateCacheWorker
+          : WinehuaPipelineOrigin::FirstUseSync,
+        endUs - winehuaCompileBeginUs);
+    }
     if (tracePipeline) {
       winehuaPipelineTraceEmit(str::format(
         "WineHuaPipelineCreate: phase=end sequence=", pipelineSequence,

@@ -1,6 +1,7 @@
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
+#include "dxvk_winehua_submit_stats.h"
 
 namespace dxvk {
 
@@ -295,6 +296,7 @@ namespace dxvk {
         workerLock = std::unique_lock<dxvk::mutex>(m_workerLock);
       
       m_workerQueue.push(item);
+      winehuaStateCacheQueued().fetch_add(1, std::memory_order_relaxed);
     }
 
     if (workerLock) {
@@ -934,6 +936,10 @@ namespace dxvk {
   void DxvkStateCache::workerFunc() {
     env::setThreadName("dxvk-shader");
 
+    /* Mark the thread so pipeline creations can be attributed to the state
+     * cache pre-compilation instead of first use on the render thread. */
+    winehuaStateCacheWorkerFlag() = true;
+
     while (true) {
       WorkerItem item;
 
@@ -958,6 +964,7 @@ namespace dxvk {
       }
 
       compilePipelines(item);
+      winehuaStateCacheCompleted().fetch_add(1, std::memory_order_relaxed);
     }
   }
 

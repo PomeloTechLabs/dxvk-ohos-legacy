@@ -10,6 +10,7 @@
 
 #include "../dxbc/dxbc_util.h"
 #include "../dxvk/dxvk_winehua_trace.h"
+#include "../dxvk/dxvk_winehua_submit_stats.h"
 
 namespace dxvk {
   
@@ -4061,12 +4062,17 @@ namespace dxvk {
         uint32_t(packedFormat), DstSubresource, subresource.arrayLayer);
     if (snormRtEmulated || bcEmulated) {
       D3D11CpuImage converted;
+      /* Account the streaming transcode so a long frame can state how much of
+       * it was BC decoding plus re-encoding rather than leaving it to guesswork. */
+      const uint64_t winehuaTranscodeBeginUs = winehuaNowUs();
       const bool convertedOk = snormRtEmulated
         ? ConvertD3D11Rgba8SnormToRgba16Float(
             extent, pSrcData, SrcRowPitch, SrcDepthPitch, converted)
         : DecodeD3D11BcImage(
             packedFormat, pDstTexture->GetImage()->info().format, extent,
             pSrcData, SrcRowPitch, SrcDepthPitch, converted);
+      winehuaRecordTranscode(winehuaNowUs() - winehuaTranscodeBeginUs,
+        uint64_t(extent.width) * uint64_t(extent.height) * 4ull);
 
       if (!convertedOk) {
         Logger::err(snormRtEmulated

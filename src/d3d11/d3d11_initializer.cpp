@@ -4,6 +4,7 @@
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
 #include "../dxvk/dxvk_winehua_trace.h"
+#include "../dxvk/dxvk_winehua_submit_stats.h"
 
 namespace dxvk {
 
@@ -189,10 +190,16 @@ namespace dxvk {
               uploadRowPitch = converted.rowPitch;
               uploadSlicePitch = converted.slicePitch;
             } else if (bcEmulated) {
-              if (!DecodeD3D11BcImage(packedFormat, image->info().format,
-                                      mipLevelExtent,
-                                      uploadData, uploadRowPitch, uploadSlicePitch,
-                                      converted))
+              /* The initial upload is where streaming transcodes land.  The
+               * work is timed so a long frame can state how much of it was BC
+               * decoding plus re-encoding rather than leaving it to guesswork. */
+              const uint64_t winehuaTranscodeBeginUs = winehuaNowUs();
+              const bool winehuaDecoded = DecodeD3D11BcImage(packedFormat,
+                image->info().format, mipLevelExtent, uploadData,
+                uploadRowPitch, uploadSlicePitch, converted);
+              winehuaRecordTranscode(winehuaNowUs() - winehuaTranscodeBeginUs,
+                uint64_t(mipLevelExtent.width) * uint64_t(mipLevelExtent.height) * 4ull);
+              if (!winehuaDecoded)
                 throw DxvkError("WineHua: Failed to decompress initial BC texture data");
               uploadData = converted.data.data();
               uploadRowPitch = converted.rowPitch;

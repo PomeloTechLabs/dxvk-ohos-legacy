@@ -12,6 +12,37 @@
 
 namespace dxvk {
 
+  /* Port telemetry and evidence dumps.
+   *
+   * Gates the work that only exists to produce evidence: formatting and
+   * appending the frame ledgers, the BC accounting, and the periodic driver
+   * memory attribution.  It is off unless a run asks for it with
+   * GTAV_OHOS_TELEMETRY=1 (launcher: --ps g9telemetry 1), so a shipped run
+   * does not pay for output nobody reads. */
+  inline bool winehuaTelemetryEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("GTAV_OHOS_TELEMETRY");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  /* Shader and pipeline dumps.
+   *
+   * Separate from the telemetry switch because it costs orders of magnitude
+   * more: two files per compiled shader, a marker file read per compile and the
+   * pipeline-state logs, which together wrote a few hundred megabytes on a
+   * first run.  A measurement run wants the ledgers without that, and a shader
+   * investigation wants the files without the frame noise, so they are two
+   * switches: GTAV_OHOS_DUMP_SHADERS=1 (launcher: --ps g9dumps 1). */
+  inline bool winehuaShaderDumpEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("GTAV_OHOS_DUMP_SHADERS");
+      return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+  }
+
   inline bool winehuaAlphaTraceEnabled() {
     static const bool enabled = [] {
       const char* value = std::getenv("DXVK_WINEHUA_TRACE_ALPHA");
@@ -648,6 +679,14 @@ namespace dxvk {
    * when the stencil stage is omitted; depth remains available for ordering.
    * Keep this narrow workaround enabled for the native OHOS target only. */
   inline bool winehuaAvoidD32S8MrtStencil() {
+    /* The medium-quality foliage pipeline no longer faults once its per-sample
+     * interpolation read is rewritten (see rewriteWinehuaSampleInterpolation),
+     * so both D32S8 workarounds are legacy diagnostics now: they only re-enable
+     * with an explicit opt-in, and they cost the geometry pass its stencil
+     * classification and its auxiliary G-buffer outputs when they do. */
+    const char* legacy = std::getenv("DXVK_WINEHUA_LEGACY_D32S8_MRT_FIX");
+    if (!legacy || legacy[0] != '1' || legacy[1] != '\0')
+      return false;
 #if defined(DXVK_NATIVE_OHOS)
     /* The workaround hides the stencil classification the deferred lighting
      * reads, so it has to stay switchable for A/B diagnosis: the launcher can
@@ -663,6 +702,12 @@ namespace dxvk {
   }
 
   inline bool winehuaSkipKnownD32S8MrtPipeline() {
+    /* See winehuaAvoidD32S8MrtStencil: the rewrite of the foliage shader's
+     * per-sample interpolation removes the driver fault these workarounds were
+     * added for, so they stay opt-in only. */
+    const char* legacy = std::getenv("DXVK_WINEHUA_LEGACY_D32S8_MRT_FIX");
+    if (!legacy || legacy[0] != '1' || legacy[1] != '\0')
+      return false;
 #if defined(DXVK_NATIVE_OHOS)
     const char* value = std::getenv("DXVK_WINEHUA_SKIP_KNOWN_D32S8_MRT");
     return !value || (value[0] == '1' && value[1] == '\0');

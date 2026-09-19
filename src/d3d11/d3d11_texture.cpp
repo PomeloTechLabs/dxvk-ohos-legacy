@@ -1,6 +1,9 @@
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 #include "d3d11_bc.h"
 #include "d3d11_device.h"
@@ -11,6 +14,145 @@
 #include "../util/util_shared_res.h"
 
 namespace dxvk {
+
+  /* Mirrored next to the shader dumps so the host can read it back. */
+  static void winehuaBcBackingLog(const std::string& text) {
+    Logger::info(text);
+    const char* dumpPath = std::getenv("DXVK_SHADER_DUMP_PATH");
+    if (!dumpPath || !dumpPath[0])
+      return;
+    std::ofstream record(
+      str::tows(str::format(dumpPath, "/g9-bc-fallback.log").c_str()).c_str(),
+      std::ios_base::app);
+    record << text << std::endl;
+  }
+
+  namespace {
+
+    /* BC backing statistics.  The device has no BC support, so every BC texture
+     * is re-encoded into a native format; this records how many textures and how
+     * many bytes each BC source format actually contributes, and how large the
+     * re-encoded backing turns out.  It is pure accounting: no mapping changes. */
+    struct BcBackingStat {
+      uint32_t textures = 0;
+      uint64_t sourceBytes = 0;
+      uint64_t backingBytes = 0;
+    };
+
+    std::array<BcBackingStat, 10> g_bcBackingStats = {};
+    std::atomic<uint32_t> g_bcBackingEvents { 0 };
+
+    int BcFormatIndex(DXGI_FORMAT format) {
+      switch (format) {
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:      return 0;
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:      return 1;
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:      return 2;
+        case DXGI_FORMAT_BC4_UNORM:           return 3;
+        case DXGI_FORMAT_BC4_SNORM:           return 4;
+        case DXGI_FORMAT_BC5_UNORM:           return 5;
+        case DXGI_FORMAT_BC5_SNORM:           return 6;
+        case DXGI_FORMAT_BC6H_TYPELESS:
+        case DXGI_FORMAT_BC6H_UF16:
+        case DXGI_FORMAT_BC6H_SF16:           return 7;
+        case DXGI_FORMAT_BC7_TYPELESS:
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB:      return 8;
+        default:                              return -1;
+      }
+    }
+
+    const char* BcFormatName(int index) {
+      static const char* const names[9] = {
+        "BC1", "BC2", "BC3", "BC4_UNORM", "BC4_SNORM",
+        "BC5_UNORM", "BC5_SNORM", "BC6H", "BC7" };
+      return (index >= 0 && index < 9) ? names[index] : "OTHER";
+    }
+
+    uint32_t SourceBlockBytes(int index) {
+      switch (index) {
+        case 0: case 3: case 4: return 8;
+        default:                return 16;
+      }
+    }
+
+    /* Returns the backing cost of one 4x4 block: block formats report their
+     * block size directly, uncompressed formats report 16 texels worth so the
+     * same block arithmetic applies to both. */
+    uint32_t BackingBytesPerBlock(VkFormat format) {
+      switch (format) {
+        /* 4x4 block formats */
+        case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
+        case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
+        case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
+        case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
+        case VK_FORMAT_EAC_R11_UNORM_BLOCK:
+        case VK_FORMAT_EAC_R11_SNORM_BLOCK:   return 8;
+        case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
+        case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+        case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
+        case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
+        case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
+        case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:   return 16;
+        /* uncompressed: return the per-pixel size shifted into a block count */
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_R16G16B16A16_SFLOAT:   return 16 * 4;
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8_SNORM:            return 2 * 16;
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8_SNORM:              return 1 * 16;
+        default:                              return 0;
+      }
+    }
+
+    void RecordBcBacking(DXGI_FORMAT format, VkFormat backing,
+                         uint32_t width, uint32_t height,
+                         uint32_t mipLevels, uint32_t arraySize) {
+      const int index = BcFormatIndex(format);
+      if (index < 0)
+        return;
+
+      uint64_t sourceBytes = 0, backingBytes = 0;
+      const uint32_t sourceBlock = SourceBlockBytes(index);
+      const uint32_t backingBlock = BackingBytesPerBlock(backing);
+      for (uint32_t mip = 0; mip < std::max(1u, mipLevels); ++mip) {
+        const uint32_t w = std::max(1u, width >> mip);
+        const uint32_t h = std::max(1u, height >> mip);
+        const uint64_t blocks = uint64_t((w + 3) / 4) * uint64_t((h + 3) / 4);
+        sourceBytes += blocks * sourceBlock;
+        backingBytes += blocks * backingBlock;
+      }
+      sourceBytes *= std::max(1u, arraySize);
+      backingBytes *= std::max(1u, arraySize);
+
+      BcBackingStat& stat = g_bcBackingStats[index];
+      stat.textures += 1;
+      stat.sourceBytes += sourceBytes;
+      stat.backingBytes += backingBytes;
+
+      const uint32_t events = g_bcBackingEvents.fetch_add(1) + 1;
+      if (events % 256 != 0 || events > 2048)
+        return;
+      for (int i = 0; i < 9; ++i) {
+        const BcBackingStat& entry = g_bcBackingStats[i];
+        if (!entry.textures)
+          continue;
+        winehuaBcBackingLog(str::format("[BC-Backing] ", BcFormatName(i),
+          " textures=", entry.textures,
+          " sourceMiB=", entry.sourceBytes / (1024 * 1024),
+          " backingMiB=", entry.backingBytes / (1024 * 1024)));
+      }
+    }
+
+  }
 
   static bool winehuaFormatTraceEnabled() {
     static const bool enabled = [] {
@@ -61,6 +203,11 @@ namespace dxvk {
     DXGI_VK_FORMAT_INFO   formatInfo   = m_device->LookupFormat(m_desc.Format, formatMode);
     DXGI_VK_FORMAT_FAMILY formatFamily = m_device->LookupFamily(m_desc.Format, formatMode);
     DXGI_VK_FORMAT_INFO   formatPacked = m_device->LookupPackedFormat(m_desc.Format, formatMode);
+    /* Accounting only: it walks every mip level and prints a table, so it
+     * follows the port's telemetry switch. */
+    if (winehuaTelemetryEnabled())
+      RecordBcBacking(m_desc.Format, formatInfo.Format,
+        m_desc.Width, m_desc.Height, m_desc.MipLevels, m_desc.ArraySize);
     m_packedFormat = formatPacked.Format;
 
     DxvkImageCreateInfo imageInfo;

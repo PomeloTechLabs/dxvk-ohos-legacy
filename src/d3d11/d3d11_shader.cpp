@@ -24,10 +24,13 @@ namespace dxvk {
     DxbcModule module(reader);
     
     // If requested by the user, dump both the raw DXBC
-    // shader and the compiled SPIR-V module to a file.
+    // shader and the compiled SPIR-V module to a file.  The port keeps this
+    // behind its shader dump switch: it was writing two files per compiled
+    // shader (a few hundred megabytes on a first run) on every shipped launch.
     const std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+    const bool dumpShaders = dumpPath.size() != 0 && winehuaShaderDumpEnabled();
     
-    if (dumpPath.size() != 0) {
+    if (dumpShaders) {
       reader.store(std::ofstream(str::tows(str::format(dumpPath, "/", name, ".dxbc").c_str()).c_str(),
         std::ios_base::binary | std::ios_base::trunc));
     }
@@ -46,7 +49,7 @@ namespace dxvk {
       : module.compile                 (*pDxbcModuleInfo, name);
     m_shader->setShaderKey(*pShaderKey);
     
-    if (dumpPath.size() != 0) {
+    if (dumpShaders) {
       std::ofstream dumpStream(
         str::tows(str::format(dumpPath, "/", name, ".spv").c_str()).c_str(),
         std::ios_base::binary | std::ios_base::trunc);

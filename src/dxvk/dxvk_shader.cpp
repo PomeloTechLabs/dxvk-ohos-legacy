@@ -281,7 +281,9 @@ namespace dxvk {
     // The game marks the draw it wants dumped with a file in the dump
     // directory; DXVK already writes there, so the path is known-good.
     bool lightDraw = false;
-    if (dumpPath && dumpPath[0]) {
+    /* Reading the marker costs a file open per compiled shader, so it follows
+     * the port's telemetry switch together with the dumps it selects. */
+    if (winehuaShaderDumpEnabled() && dumpPath && dumpPath[0]) {
       std::ifstream lightMark(
         str::tows(str::format(dumpPath, "/g9-light-draw").c_str()).c_str());
       lightDraw = lightMark.good();
@@ -476,6 +478,37 @@ namespace dxvk {
       freezeBoolSpecConstants(spirvCode, info.boolSpecMask, info.boolSpecCount);
 
     const bool isFragment = m_info.stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+    /* The medium-quality foliage shader reads its interpolant per sample
+     * (SSTAA coverage).  On a single-sample pipeline the Maleoon driver faults
+     * while compiling the pipeline that pairs that module with the full
+     * four-attachment G-buffer and the engine's stencil state, and the engine
+     * cannot recompile the shader.  Reading the interpolant directly is
+     * value-identical at one sample, so the rewrite is applied to this shader
+     * unconditionally instead of being left to the global diagnostic switch.
+     * That is what lets the geometry pass keep its stencil classification and
+     * all four G-buffer outputs, which the deferred lighting needs. */
+    const bool foliageInterpolationFix = isFragment
+      && debugName() == "FS_50c4199f44db8227ce517bf10c1e196229651ce5";
+    if (foliageInterpolationFix) {
+      const uint32_t replaced = rewriteWinehuaSampleInterpolation(spirvCode);
+      /* A second pass returning zero proves no InterpolateAtSample is left. */
+      const uint32_t remaining = rewriteWinehuaSampleInterpolation(spirvCode);
+      const char* dumpPath = std::getenv("DXVK_SHADER_DUMP_PATH");
+      if (winehuaShaderDumpEnabled() && dumpPath && dumpPath[0]) {
+        std::ofstream record(
+          str::tows(str::format(dumpPath, "/g9-tree-shader.log").c_str()).c_str(),
+          std::ios_base::app);
+        record << "TREE_SHADER_FINAL fs=" << debugName()
+               << " stage=fragment foliageFix=1 replaced=" << replaced
+               << " remaining=" << remaining
+               << " codeSize=" << spirvCode.dwords() * 4
+               << std::endl;
+      }
+      Logger::info(str::format(
+        "WineHuaTreeShader: fs=", debugName(), " replaced=", replaced,
+        " remaining=", remaining,
+        " codeSize=", spirvCode.dwords() * 4));
+    }
     const bool dropAuxiliaryOutputs = info.winehuaDropAuxiliaryOutputs && isFragment;
     const bool dropSampleMaskOutput = isFragment && winehuaDropSampleMaskOutput();
 

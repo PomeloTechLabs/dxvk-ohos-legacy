@@ -1,5 +1,6 @@
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
+#include "dxvk_winehua_submit_stats.h"
 
 #include <algorithm>
 #include <array>
@@ -522,6 +523,7 @@ namespace dxvk {
     const VkResult result = m_vkd->vkQueueSubmit(queue, 1, &submitInfo, fence);
 #if defined(DXVK_NATIVE_OHOS)
     g_g9CurrentQueueSubmitUs += g9SteadyClockUs() - queueSubmitStartUs;
+    winehuaRecordSubmit(WinehuaSubmitReason::CommandList);
 #endif
     return result;
   }

@@ -141,8 +141,8 @@ namespace dxvk {
     
   private:
     
-    std::array<DXGI_VK_FORMAT_MAPPING, 133> m_dxgiFormats;
-    std::array<DXGI_VK_FORMAT_FAMILY,  133> m_dxgiFamilies;
+    std::array<DXGI_VK_FORMAT_MAPPING, 139> m_dxgiFormats;
+    std::array<DXGI_VK_FORMAT_FAMILY,  139> m_dxgiFamilies;
 
     DXGI_VK_FORMAT_INFO GetFormatInfoFromMapping(
       const DXGI_VK_FORMAT_MAPPING* pMapping,

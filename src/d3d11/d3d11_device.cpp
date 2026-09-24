@@ -218,6 +218,23 @@ namespace dxvk {
 
     if (!pDesc)
       return E_INVALIDARG;
+
+    // These private IDs are a narrow upload-only contract for the product's
+    // prevalidated AOT payloads. They must never become a second BC fallback
+    // or an alternate path for writable/ordinary D3D textures.
+    if (pDesc->Format >= DXGI_FORMAT_OHOS_AOT_ASTC_4X4_UNORM &&
+        pDesc->Format <= DXGI_FORMAT_OHOS_AOT_EAC_RG11_SNORM) {
+      #if defined(DXVK_NATIVE_OHOS)
+      if (pDesc->Usage != D3D11_USAGE_IMMUTABLE ||
+          pDesc->BindFlags != D3D11_BIND_SHADER_RESOURCE ||
+          pDesc->CPUAccessFlags || pDesc->MiscFlags ||
+          pDesc->ArraySize != 1 || pDesc->SampleDesc.Count != 1 ||
+          !pInitialData)
+        return E_INVALIDARG;
+      #else
+      return E_INVALIDARG;
+      #endif
+    }
     
     D3D11_COMMON_TEXTURE_DESC desc;
     desc.Width          = pDesc->Width;

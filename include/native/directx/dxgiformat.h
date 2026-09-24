@@ -147,6 +147,15 @@ typedef enum DXGI_FORMAT {
     DXGI_FORMAT_P208 = 0x82,
     DXGI_FORMAT_V208 = 0x83,
     DXGI_FORMAT_V408 = 0x84,
+    // Private OHOS AOT texture formats. Only the product's prevalidated
+    // read-only texture path may use these; standard DXGI/BC formats remain
+    // unchanged and continue through the existing compatibility path.
+    DXGI_FORMAT_OHOS_AOT_ASTC_4X4_UNORM = 0x85,
+    DXGI_FORMAT_OHOS_AOT_ASTC_4X4_SRGB = 0x86,
+    DXGI_FORMAT_OHOS_AOT_EAC_R11_UNORM = 0x87,
+    DXGI_FORMAT_OHOS_AOT_EAC_R11_SNORM = 0x88,
+    DXGI_FORMAT_OHOS_AOT_EAC_RG11_UNORM = 0x89,
+    DXGI_FORMAT_OHOS_AOT_EAC_RG11_SNORM = 0x8a,
     DXGI_FORMAT_FORCE_UINT = 0xffffffff
 } DXGI_FORMAT;
 /* Begin additional prototypes for all interfaces */

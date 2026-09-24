@@ -8,6 +8,12 @@
 
 namespace dxvk {
 
+  static_assert(DXGI_FORMAT_BC1_UNORM == 0x47 && DXGI_FORMAT_BC7_UNORM_SRGB == 0x63,
+    "the private AOT extension must not renumber standard BC formats");
+  static_assert(DXGI_FORMAT_OHOS_AOT_ASTC_4X4_UNORM == DXGI_FORMAT_V408 + 1 &&
+    DXGI_FORMAT_OHOS_AOT_EAC_RG11_SNORM == DXGI_FORMAT_V408 + 6,
+    "OHOS AOT format table must be contiguous after standard DXGI formats");
+
   /* The DXVK log lives in a sandboxed directory the host cannot read back, so
    * the BC backing report is mirrored next to the shader dumps, which the
    * launcher points at a readable location. */
@@ -22,7 +28,7 @@ namespace dxvk {
     record << text << std::endl;
   }
   
-  const std::array<DXGI_VK_FORMAT_MAPPING, 133> g_dxgiFormats = {{
+  const std::array<DXGI_VK_FORMAT_MAPPING, 139> g_dxgiFormats = {{
     // DXGI_FORMAT_UNKNOWN
     { },
     // DXGI_FORMAT_R32G32B32A32_TYPELESS
@@ -557,10 +563,30 @@ namespace dxvk {
     { }, // Unsupported
     // DXGI_FORMAT_V408
     { }, // Unsupported
+    // Private OHOS AOT formats: the packed bytes already match Vulkan. These
+    // entries do not remap or alter any standard BC format or fallback.
+    // DXGI_FORMAT_OHOS_AOT_ASTC_4X4_UNORM
+    { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_UNDEFINED,
+      VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
+    // DXGI_FORMAT_OHOS_AOT_ASTC_4X4_SRGB
+    { VK_FORMAT_ASTC_4x4_SRGB_BLOCK, VK_FORMAT_UNDEFINED,
+      VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
+    // DXGI_FORMAT_OHOS_AOT_EAC_R11_UNORM
+    { VK_FORMAT_EAC_R11_UNORM_BLOCK, VK_FORMAT_UNDEFINED,
+      VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
+    // DXGI_FORMAT_OHOS_AOT_EAC_R11_SNORM
+    { VK_FORMAT_EAC_R11_SNORM_BLOCK, VK_FORMAT_UNDEFINED,
+      VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
+    // DXGI_FORMAT_OHOS_AOT_EAC_RG11_UNORM
+    { VK_FORMAT_EAC_R11G11_UNORM_BLOCK, VK_FORMAT_UNDEFINED,
+      VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
+    // DXGI_FORMAT_OHOS_AOT_EAC_RG11_SNORM
+    { VK_FORMAT_EAC_R11G11_SNORM_BLOCK, VK_FORMAT_UNDEFINED,
+      VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
   }};
 
 
-  const std::array<DXGI_VK_FORMAT_FAMILY, 133> g_dxgiFamilies = {{
+  const std::array<DXGI_VK_FORMAT_FAMILY, 139> g_dxgiFamilies = {{
     // DXGI_FORMAT_UNKNOWN
     { },
     // DXGI_FORMAT_R32G32B32A32_TYPELESS
@@ -862,6 +888,13 @@ namespace dxvk {
     { }, // Unsupported
     // DXGI_FORMAT_V408
     { }, // Unsupported
+    // Private OHOS AOT formats have no mutable reinterpretation family.
+    { }, // ASTC 4x4 UNORM
+    { }, // ASTC 4x4 SRGB
+    { }, // EAC R11 UNORM
+    { }, // EAC R11 SNORM
+    { }, // EAC RG11 UNORM
+    { }, // EAC RG11 SNORM
   }};
   
   

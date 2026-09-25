@@ -2202,6 +2202,8 @@ namespace dxvk {
     
     // Query Vulkan format properties and supported features for it
     const DxvkFormatInfo* fmtProperties = imageFormatInfo(fmtMapping.Format);
+    if (fmtProperties == nullptr)
+      return E_FAIL;
 
     VkFormatProperties fmtSupport = fmtMapping.Format != VK_FORMAT_UNDEFINED
       ? m_dxvkAdapter->formatProperties(fmtMapping.Format)

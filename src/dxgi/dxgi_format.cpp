@@ -28,7 +28,7 @@ namespace dxvk {
     record << text << std::endl;
   }
   
-  const std::array<DXGI_VK_FORMAT_MAPPING, 139> g_dxgiFormats = {{
+  constexpr std::array<DXGI_VK_FORMAT_MAPPING, 139> g_dxgiFormats = {{
     // DXGI_FORMAT_UNKNOWN
     { },
     // DXGI_FORMAT_R32G32B32A32_TYPELESS
@@ -557,6 +557,10 @@ namespace dxvk {
       VK_FORMAT_UNDEFINED,
       VK_FORMAT_UNDEFINED,
       VK_IMAGE_ASPECT_COLOR_BIT },
+    // Reserved DXGI_FORMAT values 0x74..0x81. Keep table indices aligned
+    // with the sparse enum before P208 and the private OHOS AOT formats.
+    { }, { }, { }, { }, { }, { }, { },
+    { }, { }, { }, { }, { }, { }, { },
     // DXGI_FORMAT_P208
     { }, // Unsupported
     // DXGI_FORMAT_V208
@@ -584,6 +588,25 @@ namespace dxvk {
     { VK_FORMAT_EAC_R11G11_SNORM_BLOCK, VK_FORMAT_UNDEFINED,
       VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT },
   }};
+
+  static_assert(g_dxgiFormats[DXGI_FORMAT_BC1_UNORM].FormatColor
+      == VK_FORMAT_BC1_RGBA_UNORM_BLOCK &&
+    g_dxgiFormats[DXGI_FORMAT_B4G4R4A4_UNORM].FormatColor
+      == VK_FORMAT_A4R4G4B4_UNORM_PACK16_EXT &&
+    g_dxgiFormats[DXGI_FORMAT_P208].FormatColor == VK_FORMAT_UNDEFINED &&
+    g_dxgiFormats[DXGI_FORMAT_OHOS_AOT_ASTC_4X4_UNORM].FormatColor
+      == VK_FORMAT_ASTC_4x4_UNORM_BLOCK &&
+    g_dxgiFormats[DXGI_FORMAT_OHOS_AOT_ASTC_4X4_SRGB].FormatColor
+      == VK_FORMAT_ASTC_4x4_SRGB_BLOCK &&
+    g_dxgiFormats[DXGI_FORMAT_OHOS_AOT_EAC_R11_UNORM].FormatColor
+      == VK_FORMAT_EAC_R11_UNORM_BLOCK &&
+    g_dxgiFormats[DXGI_FORMAT_OHOS_AOT_EAC_R11_SNORM].FormatColor
+      == VK_FORMAT_EAC_R11_SNORM_BLOCK &&
+    g_dxgiFormats[DXGI_FORMAT_OHOS_AOT_EAC_RG11_UNORM].FormatColor
+      == VK_FORMAT_EAC_R11G11_UNORM_BLOCK &&
+    g_dxgiFormats[DXGI_FORMAT_OHOS_AOT_EAC_RG11_SNORM].FormatColor
+      == VK_FORMAT_EAC_R11G11_SNORM_BLOCK,
+    "DXGI format table must be indexed by the sparse DXGI_FORMAT enum");
 
 
   const std::array<DXGI_VK_FORMAT_FAMILY, 139> g_dxgiFamilies = {{
@@ -882,6 +905,9 @@ namespace dxvk {
     { }, // Unsupported
     // DXGI_FORMAT_B4G4R4A4_UNORM
     { }, // Unsupported
+    // Reserved DXGI_FORMAT values 0x74..0x81.
+    { }, { }, { }, { }, { }, { }, { },
+    { }, { }, { }, { }, { }, { }, { },
     // DXGI_FORMAT_P208
     { }, // Unsupported
     // DXGI_FORMAT_V208

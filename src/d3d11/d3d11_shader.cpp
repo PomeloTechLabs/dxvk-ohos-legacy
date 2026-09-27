@@ -1,6 +1,9 @@
 #include "d3d11_device.h"
 #include "d3d11_shader.h"
 #include "../dxvk/dxvk_winehua_trace.h"
+#if defined(DXVK_NATIVE_OHOS)
+#include "../util/util_ohos_perf.h"
+#endif
 
 namespace dxvk {
   
@@ -44,9 +47,18 @@ namespace dxvk {
     if (module.programInfo().shaderStage() != pShaderKey->type() && !passthroughShader)
       throw DxvkError("Mismatching shader type.");
 
+#if defined(DXVK_NATIVE_OHOS)
+    const uint64_t perfCompileStart = ohosperf::enabled() ? ohosperf::nowNs() : 0;
+#endif
     m_shader = passthroughShader
       ? module.compilePassthroughShader(*pDxbcModuleInfo, name)
       : module.compile                 (*pDxbcModuleInfo, name);
+#if defined(DXVK_NATIVE_OHOS)
+    if (perfCompileStart)
+      ohosperf::record(DXVK_OHOS_PERF_SHADER_COMPILE, 0,
+        ohosperf::elapsedUs(perfCompileStart), BytecodeLength,
+        uint32_t(pShaderKey->type()));
+#endif
     m_shader->setShaderKey(*pShaderKey);
     
     if (dumpShaders) {

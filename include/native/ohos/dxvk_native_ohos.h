@@ -57,6 +57,65 @@ typedef struct DXVKOhosPerformanceStats {
   uint32_t imageCount;
 } DXVKOhosPerformanceStats;
 
+enum DXVKOhosPerfEventType {
+  DXVK_OHOS_PERF_GAME_FRAME = 1,
+  DXVK_OHOS_PERF_PRESENT = 2,
+  DXVK_OHOS_PERF_TEXTURE_INIT = 3,
+  DXVK_OHOS_PERF_SHADER_COMPILE = 4,
+  DXVK_OHOS_PERF_PIPELINE_CREATE = 5,
+  DXVK_OHOS_PERF_COMMAND_SUBMIT = 6,
+  DXVK_OHOS_PERF_RESOURCE_READ = 7,
+  DXVK_OHOS_PERF_NATIVE_PASS = 8,
+  DXVK_OHOS_PERF_QUEUE_ENQUEUE = 9,
+  DXVK_OHOS_PERF_SYNC_WAIT = 10,
+  DXVK_OHOS_PERF_GAME_UPDATE = 11,
+  DXVK_OHOS_PERF_RENDER_CPU = 12,
+  DXVK_OHOS_PERF_GPU_FRAME = 13,
+  DXVK_OHOS_PERF_TEXTURE_RESOURCE = 14,
+  DXVK_OHOS_PERF_RENDER_THREAD_WAIT = 15,
+  DXVK_OHOS_PERF_CONTEXT_LOCK_WAIT = 16,
+  DXVK_OHOS_PERF_SAFE_MODE_WORK = 17,
+  DXVK_OHOS_PERF_REMOVE_ALL_REFS = 18,
+  DXVK_OHOS_PERF_GPU_FENCE_WAIT = 19,
+  DXVK_OHOS_PERF_PENDING_BUFFER_UPDATES = 20,
+  DXVK_OHOS_PERF_GAME_LOGIC_UPDATE = 21,
+  DXVK_OHOS_PERF_DRAWLIST_BUILD = 22,
+  DXVK_OHOS_PERF_CONTROL_THREAD_WAIT = 23,
+  DXVK_OHOS_PERF_AUDIO_WAIT = 24,
+  DXVK_OHOS_PERF_AUDIO_SEMA_WAIT = 25,
+  DXVK_OHOS_PERF_AUDIO_POST_WORK = 26,
+  DXVK_OHOS_PERF_AUDIO_MIXER_COMMAND_WAIT = 27,
+  DXVK_OHOS_PERF_AUDIO_WORKER_UPDATE = 28,
+  DXVK_OHOS_PERF_AUDIO_WORKER_REQUEST = 29,
+  DXVK_OHOS_PERF_AUDIO_WORKER_WAKE = 30,
+  DXVK_OHOS_PERF_AUDIO_WORKER_DONE = 31
+};
+
+typedef struct DXVKOhosPerfEvent {
+  uint64_t sequence;
+  uint64_t monotonicNs;
+  uint64_t frameId;
+  uint32_t type;
+  uint32_t threadId;
+  uint32_t durationUs;
+  uint32_t flags;
+  uint64_t a;
+  uint64_t b;
+  uint64_t c;
+  uint64_t d;
+  uint64_t e;
+  uint64_t f;
+} DXVKOhosPerfEvent;
+
+typedef struct DXVKOhosPerfReadout {
+  uint32_t size;
+  uint32_t version;
+  uint32_t capacity;
+  uint32_t count;
+  uint64_t dropped;
+  DXVKOhosPerfEvent* events;
+} DXVKOhosPerfReadout;
+
 #define DXVK_OHOS_API __attribute__((visibility("default")))
 
 /* Register during the XComponent surface-created callback, while window is
@@ -98,6 +157,12 @@ DXVK_OHOS_API int32_t DXVKOhosGetStateCacheStats(
  */
 DXVK_OHOS_API int32_t DXVKOhosGetPerformanceStats(
   DXVKOhosPerformanceStats* stats);
+
+/* Optional bounded trace. a-d are event-specific counters; zero means unknown.
+ * The read call drains at most capacity events without waiting for the GPU. */
+DXVK_OHOS_API int32_t DXVKOhosReadPerfEvents(DXVKOhosPerfReadout* readout);
+DXVK_OHOS_API void DXVKOhosRecordPerfEvent(uint32_t type, uint64_t frameId,
+  uint32_t durationUs, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 
 /* Test-only, same-process fault injection. The call is rejected unless
  * DXVK_OHOS_TEST_DEVICE_LOST=1. It marks the supplied DXVK-backed D3D11

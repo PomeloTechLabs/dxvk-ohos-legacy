@@ -7,6 +7,7 @@
 #include "../wsi/ohos_present_policy.h"
 #include "../dxvk/dxvk_ohos_memory_stats.h"
 #include "../dxvk/dxvk_winehua_submit_stats.h"
+#include "../util/util_ohos_perf.h"
 
 #include <array>
 #include <atomic>
@@ -686,6 +687,11 @@ namespace dxvk {
     }
     const uint64_t g9HudIntervalUs = g9EnterUs - g9HudPreviousFrameUs;
     g9HudPreviousFrameUs = g9EnterUs;
+    if (ohosperf::enabled() && g9HudIntervalUs)
+      ohosperf::record(DXVK_OHOS_PERF_PRESENT, m_frameId,
+        uint32_t(std::min<uint64_t>(g9HudIntervalUs, UINT32_MAX)),
+        g9TotalUs, m_device->getStatCounters().getCtr(DxvkStatCounter::GpuIdleTicks),
+        g9QueueWaitUs, g9AcquireUs, g9CommandSubmitUs, g9CommandSubmitCount);
     if (g9HudIntervalUs && g9HudIntervalUs <= UINT32_MAX &&
         g9HudFrameIntervalCount < g9HudFrameIntervals.size())
       g9HudFrameIntervals[g9HudFrameIntervalCount++] =

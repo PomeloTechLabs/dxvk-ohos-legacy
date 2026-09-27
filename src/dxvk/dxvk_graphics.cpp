@@ -7,6 +7,9 @@
 #include "dxvk_state_cache.h"
 #include "dxvk_winehua_trace.h"
 #include "dxvk_winehua_submit_stats.h"
+#if defined(DXVK_NATIVE_OHOS)
+#include "../util/util_ohos_perf.h"
+#endif
 
 #include <atomic>
 #include <cstdlib>
@@ -719,6 +722,13 @@ namespace dxvk {
           ? WinehuaPipelineOrigin::StateCacheWorker
           : WinehuaPipelineOrigin::FirstUseSync,
         endUs - winehuaCompileBeginUs);
+#if defined(DXVK_NATIVE_OHOS)
+      if (ohosperf::enabled())
+        ohosperf::record(DXVK_OHOS_PERF_PIPELINE_CREATE, 0,
+          uint32_t(std::min<uint64_t>(endUs - winehuaCompileBeginUs, UINT32_MAX)),
+          1, uint32_t(pipelineStatus),
+          winehuaStateCacheWorkerFlag() ? 1 : 0);
+#endif
     }
     if (tracePipeline) {
       winehuaPipelineTraceEmit(str::format(

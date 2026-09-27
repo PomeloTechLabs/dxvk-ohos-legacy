@@ -10,6 +10,9 @@
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
 #include "dxvk_winehua_trace.h"
+#if defined(DXVK_NATIVE_OHOS)
+#include "../util/util_ohos_perf.h"
+#endif
 
 namespace dxvk {
   
@@ -150,9 +153,17 @@ namespace dxvk {
     }
 
     VkPipeline pipeline = VK_NULL_HANDLE;
+#if defined(DXVK_NATIVE_OHOS)
+    const uint64_t perfPipelineStart = ohosperf::enabled() ? ohosperf::nowNs() : 0;
+#endif
     const VkResult pipelineStatus = m_vkd->vkCreateComputePipelines(
       m_vkd->device(), m_pipeMgr->m_cache->handle(),
       1, &info, nullptr, &pipeline);
+#if defined(DXVK_NATIVE_OHOS)
+    if (perfPipelineStart)
+      ohosperf::record(DXVK_OHOS_PERF_PIPELINE_CREATE, 0,
+        ohosperf::elapsedUs(perfPipelineStart), 2, uint32_t(pipelineStatus));
+#endif
     if (tracePipeline) {
       winehuaPipelineTraceEmit(str::format(
         "WineHuaPipelineCreate: phase=end sequence=", pipelineSequence,

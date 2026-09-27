@@ -21,7 +21,7 @@ if not dxvk_native_ohos
 endif
 
 if dxvk_native_ohos
-  dxgi_src += files('dxgi_ohos_window.cpp')
+  dxgi_src += files('dxgi_ohos_window.cpp', 'dxgi_ohos_perf.cpp')
   dxgi_dll = shared_library('dxvk_dxgi', dxgi_src,
     dependencies        : [ dxvk_dep, lib_native_window ],
     include_directories : dxvk_include_path,

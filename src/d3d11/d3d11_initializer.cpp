@@ -5,6 +5,9 @@
 #include "d3d11_initializer.h"
 #include "../dxvk/dxvk_winehua_trace.h"
 #include "../dxvk/dxvk_winehua_submit_stats.h"
+#if defined(DXVK_NATIVE_OHOS)
+#include "../util/util_ohos_perf.h"
+#endif
 
 namespace dxvk {
 
@@ -141,7 +144,17 @@ namespace dxvk {
   void D3D11Initializer::InitDeviceLocalTexture(
           D3D11CommonTexture*         pTexture,
     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
-    std::lock_guard<dxvk::mutex> lock(m_mutex);
+#if defined(DXVK_NATIVE_OHOS)
+    const uint64_t perfStart = ohosperf::enabled() ? ohosperf::nowNs() : 0;
+#endif
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
+#if defined(DXVK_NATIVE_OHOS)
+    const uint64_t perfWaitUs = perfStart ?
+      (ohosperf::nowNs() - perfStart) / 1000ull : 0;
+    uint64_t perfDecodeUs = 0;
+    uint64_t perfUploadBytes = 0;
+    uint64_t perfSourceSample = 0;
+#endif
     
     Rc<DxvkImage> image = pTexture->GetImage();
 
@@ -181,6 +194,42 @@ namespace dxvk {
             const bool bcEmulated = formatInfo->flags.test(DxvkFormatFlag::BlockCompressed)
                                  && image->info().format != packedFormat;
             const bool snormRtEmulated = pTexture->IsRgba8SnormRtEmulated();
+#if defined(DXVK_NATIVE_OHOS)
+            if (perfStart && bcEmulated && layer == 0 && level == 0) {
+              // Sample three compressed rows to recognize repeated uploads.
+              // Only diagnostic runs do this; it does not read or hash the
+              // complete texture, and a match is a candidate, not an identity.
+              const uint64_t blocksX =
+                (uint64_t(mipLevelExtent.width) + formatInfo->blockSize.width - 1)
+                / formatInfo->blockSize.width;
+              const uint64_t blocksY =
+                (uint64_t(mipLevelExtent.height) + formatInfo->blockSize.height - 1)
+                / formatInfo->blockSize.height;
+              const uint64_t rowBytes = blocksX * formatInfo->elementSize;
+              const uint64_t pitch = pInitialData[id].SysMemPitch;
+              if (blocksY && pitch >= rowBytes && rowBytes) {
+                uint64_t hash = 14695981039346656037ull;
+                const auto mix = [&hash](uint64_t value) {
+                  hash ^= value;
+                  hash *= 1099511628211ull;
+                };
+                mix(uint32_t(packedFormat));
+                mix(mipLevelExtent.width);
+                mix(mipLevelExtent.height);
+                mix(desc->MipLevels);
+                mix(rowBytes);
+                const uint8_t* source = static_cast<const uint8_t*>(uploadData);
+                const uint64_t sampledBytes = std::min<uint64_t>(rowBytes, 64);
+                const uint64_t sampleRows[3] = { 0, blocksY / 2, blocksY - 1 };
+                for (uint64_t row : sampleRows) {
+                  const uint8_t* rowData = source + row * pitch;
+                  for (uint64_t byte = 0; byte < sampledBytes; ++byte)
+                    mix(rowData[byte]);
+                }
+                perfSourceSample = hash ? hash : 1;
+              }
+            }
+#endif
             if (snormRtEmulated) {
               if (!ConvertD3D11Rgba8SnormToRgba16Float(
                     mipLevelExtent, uploadData, uploadRowPitch, uploadSlicePitch,
@@ -199,6 +248,9 @@ namespace dxvk {
                 uploadRowPitch, uploadSlicePitch, converted);
               winehuaRecordTranscode(winehuaNowUs() - winehuaTranscodeBeginUs,
                 uint64_t(mipLevelExtent.width) * uint64_t(mipLevelExtent.height) * 4ull);
+#if defined(DXVK_NATIVE_OHOS)
+              if (perfStart) perfDecodeUs += winehuaNowUs() - winehuaTranscodeBeginUs;
+#endif
               if (!winehuaDecoded)
                 throw DxvkError("WineHua: Failed to decompress initial BC texture data");
               uploadData = converted.data.data();
@@ -207,9 +259,13 @@ namespace dxvk {
             }
 
             m_transferCommands += 1;
-            m_transferMemory   += (snormRtEmulated || bcEmulated)
-                                ? converted.data.size()
-                                : pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
+            const uint64_t uploadBytes = (snormRtEmulated || bcEmulated)
+              ? converted.data.size()
+              : pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
+            m_transferMemory += uploadBytes;
+#if defined(DXVK_NATIVE_OHOS)
+            perfUploadBytes += uploadBytes;
+#endif
             
             VkImageSubresourceLayers subresourceLayers;
             subresourceLayers.aspectMask     = formatInfo->aspectMask;
@@ -289,6 +345,23 @@ namespace dxvk {
     }
 
     FlushImplicit();
+#if defined(DXVK_NATIVE_OHOS)
+    if (perfStart) {
+      const uint32_t totalUs = ohosperf::elapsedUs(perfStart);
+      // Staging textures have a mapped backing buffer, not a VkImage.
+      // Keep the source format in the trace without dereferencing that null image.
+      const VkFormat actualFormat = mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_STAGING
+        ? packedFormat : image->info().format;
+      const uint64_t formatPair =
+        (uint64_t(uint32_t(packedFormat)) << 32) |
+        uint32_t(actualFormat);
+      lock.unlock();
+      ohosperf::record(DXVK_OHOS_PERF_TEXTURE_INIT, 0, totalUs,
+        perfWaitUs, perfDecodeUs, perfSourceSample,
+        totalUs > perfWaitUs ? totalUs - perfWaitUs : 0,
+        perfUploadBytes, formatPair, 1);
+    }
+#endif
   }
 
 
